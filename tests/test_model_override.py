@@ -94,6 +94,11 @@ def test_validate_model_override_rejects_unsafe_values(value: str) -> None:
         "antigravity",
         "kiro-native",
         "native-kiro",
+        # hermes: model reaches the CLI via HARNESS_HERMES_MODEL (spawn-env);
+        # hermes-native takes ``-m`` at TUI launch (native harness).
+        "hermes",
+        "hermes-native",
+        "native-hermes",
     ],
 )
 def test_harness_supports_model_override_for_plumbed_harnesses(harness: str) -> None:

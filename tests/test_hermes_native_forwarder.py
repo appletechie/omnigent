@@ -763,10 +763,19 @@ async def test_usage_tracker_deduplicates(tmp_path, monkeypatch) -> None:
     assert len(client.posts) == 1  # only the first flush posts
 
 
-async def test_usage_tracker_no_post_when_no_model(tmp_path) -> None:
-    """No config / no model -> nothing posted."""
+async def test_usage_tracker_no_post_when_no_model(tmp_path, monkeypatch) -> None:
+    """No per-session config and no readable user config -> nothing posted.
+
+    Isolate ``Path.home`` to an empty dir so the ``~/.hermes/config.yaml``
+    fallback in :func:`_read_model_from_hermes_config` genuinely finds nothing
+    (otherwise the developer's real Hermes config would leak a model in).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(f.Path, "home", staticmethod(lambda: home))
+
     client = _FakeClient()
-    tracker = f._HermesUsageTracker(client, "conv_none", tmp_path)
+    tracker = f._HermesUsageTracker(client, "conv_none", tmp_path / "bridge")
     await tracker.flush()
     assert len(client.posts) == 0
 
@@ -782,6 +791,22 @@ async def test_read_model_from_hermes_config_fallback(tmp_path, monkeypatch) -> 
 
     model = f._read_model_from_hermes_config(tmp_path / "nonexistent")
     assert model == "from-user-config"
+
+
+def test_read_model_from_hermes_config_mapping_shape(tmp_path) -> None:
+    """A real Hermes ``config.yaml`` stores ``model`` as a mapping
+    (``{default, provider, ...}``), not a bare string — the reader must surface
+    ``model.default`` so the web UI's model readout is not silently blank."""
+    bridge_dir = tmp_path / "bridge"
+    hermes_home = bridge_dir / "hermes_home"
+    hermes_home.mkdir(parents=True)
+    import yaml
+
+    (hermes_home / "config.yaml").write_text(
+        yaml.dump({"model": {"default": "gpt-5.5", "provider": "openai-codex"}})
+    )
+
+    assert f._read_model_from_hermes_config(bridge_dir) == "gpt-5.5"
 
 
 # --- Compaction persistence tests -------------------------------------------

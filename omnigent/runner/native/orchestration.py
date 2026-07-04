@@ -2702,6 +2702,29 @@ async def _auto_create_goose_terminal(
     return terminal_view
 
 
+def _hermes_launch_args_with_model(base_args: list[str], model_override: str | None) -> list[str]:
+    """Return *base_args* with a top-level ``-m <model>`` appended when a
+    per-session model override is set for the resident Hermes TUI.
+
+    hermes-native is a native harness, so — like cursor-native — the persisted
+    ``/model`` (or ``args.model`` / ``executor.model``) override reaches the CLI
+    as a terminal-launch argv, not a ``HARNESS_<H>_MODEL`` spawn-env var. Skips
+    insertion when the user already pinned a model via passthrough launch args
+    (``omnigent hermes -- -m X``) so the CLI never sees two ``-m`` values.
+    Mirrors the ``--model`` guard in :func:`_auto_create_cursor_terminal`.
+
+    :param base_args: The user pass-through launch args (may be empty).
+    :param model_override: The validated per-session model override, or ``None``.
+    :returns: The launch args, with ``-m <model_override>`` appended when applicable.
+    """
+    args = list(base_args)
+    if model_override and not any(
+        arg in ("-m", "--model") or arg.startswith("--model=") for arg in args
+    ):
+        args.extend(["-m", model_override])
+    return args
+
+
 async def _auto_create_hermes_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2768,7 +2791,15 @@ async def _auto_create_hermes_terminal(
     # ``started_at`` is at/after this instant (minus a small skew). A wiped bridge
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
-    hermes_args = [*(launch_config.terminal_launch_args or [])]
+    # Bake the persisted per-session ``/model`` override in as a top-level
+    # ``hermes -m <model>`` flag so the resident TUI launches on the chosen model
+    # — the native-CLI analog of the ``HARNESS_<H>_MODEL`` spawn-env var the SDK
+    # harnesses use (hermes-native cannot re-select a model per turn once the TUI
+    # is up, so the model is fixed here at launch).
+    hermes_args = _hermes_launch_args_with_model(
+        [*(launch_config.terminal_launch_args or [])],
+        launch_config.model_override,
+    )
     # Resolve the per-session HERMES_HOME early: the fork block below needs it
     # to place the cloned state.db, and the env block after needs it for the
     # HERMES_HOME env var.

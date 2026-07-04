@@ -1983,6 +1983,46 @@ def _build_kimi_spawn_env(
     return env
 
 
+def _build_hermes_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, str]:
+    """Build the env-var dict the ``hermes`` harness wrap reads.
+
+    Maps ``spec.executor`` fields → the ``HARNESS_HERMES_*`` env vars defined in
+    :mod:`omnigent.inner.hermes_harness`. The executor turns ``HARNESS_HERMES_MODEL``
+    into a ``hermes chat -m <model>`` flag, so threading the model here is what
+    makes ``args.model`` / ``executor.model`` (and a per-session ``/model``
+    override, applied on top in :func:`omnigent.runner.app._build_spawn_env_from_spec`)
+    actually reach the Hermes CLI.
+
+    Hermes is OWN_AUTH: provider/credentials live in ``~/.hermes`` (configured
+    once via ``hermes model`` / ``hermes auth``) and are copied into the
+    per-session ``HERMES_HOME`` by the executor, so — like the sibling
+    :func:`_build_kimi_spawn_env` — this builder threads only the model, working
+    directory, and ``os_env`` sandbox spec; there is no per-spawn provider
+    env-var surface to translate a ``ProviderAuth`` into.
+
+    :param spec: The agent spec.
+    :param cwd: Runtime working directory for the hermes subprocess — the
+        session workspace, not the agent bundle dir. Threaded as
+        ``HARNESS_HERMES_CWD`` so Hermes' tools operate on the user's project;
+        when unset the wrap falls back to ``OMNIGENT_RUNNER_WORKSPACE``.
+    :returns: A dict of env-var overrides.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_HERMES_MODEL"] = model
+    if cwd is not None:
+        env["HARNESS_HERMES_CWD"] = str(cwd)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_HERMES_OS_ENV"] = os_env_payload
+    return env
+
+
 def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Map ``spec.executor`` fields → the ``HARNESS_ANTIGRAVITY_*`` env vars the

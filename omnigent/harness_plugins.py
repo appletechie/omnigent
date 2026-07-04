@@ -784,6 +784,13 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
+        # ``hermes`` is a CLI-subprocess harness (OWN_AUTH, ``~/.hermes``); its
+        # executor reads ``HARNESS_HERMES_MODEL`` and forwards it to the CLI as
+        # ``hermes chat -m <model>`` (see :mod:`omnigent.inner.hermes_executor`).
+        # ``hermes-native`` (the resident TUI) is intentionally NOT here: like
+        # the other native CLIs it takes the model as a ``-m`` argv at terminal
+        # launch (see ``_auto_create_hermes_terminal``), not via a spawn-env var.
+        "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",

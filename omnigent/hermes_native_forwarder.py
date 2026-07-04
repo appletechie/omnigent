@@ -156,6 +156,16 @@ def _read_model_from_hermes_config(bridge_dir: Path) -> str | None:
             model = data.get("model")
             if isinstance(model, str) and model:
                 return model
+            # Hermes' ``config.yaml`` stores the model as a mapping
+            # (``model: {default: <id>, provider: <name>, ...}`` — the shape
+            # ``hermes model`` writes and that the per-session HERMES_HOME
+            # inherits), not a bare string. Surface the default id so the web
+            # UI's usage/model readout reflects the configured model instead of
+            # silently showing nothing.
+            if isinstance(model, dict):
+                default = model.get("default")
+                if isinstance(default, str) and default:
+                    return default
         except Exception:  # noqa: BLE001
             continue
     return None

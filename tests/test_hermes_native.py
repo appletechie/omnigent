@@ -43,6 +43,34 @@ def test_terminal_resource_id_stable() -> None:
     assert hn.hermes_terminal_resource_id() == hn.hermes_terminal_resource_id()
 
 
+def test_launch_args_with_model_appends_model_flag() -> None:
+    """A per-session model override lands as a top-level ``-m <model>`` so the
+    resident Hermes TUI launches on the chosen model."""
+    from omnigent.runner.native.orchestration import _hermes_launch_args_with_model
+
+    args = _hermes_launch_args_with_model([], "anthropic/claude-sonnet-4")
+    assert args == ["-m", "anthropic/claude-sonnet-4"]
+
+
+def test_launch_args_with_model_no_override_is_passthrough() -> None:
+    """No override → args are untouched (Hermes uses its own configured default)."""
+    from omnigent.runner.native.orchestration import _hermes_launch_args_with_model
+
+    assert _hermes_launch_args_with_model(["--resume", "abc"], None) == ["--resume", "abc"]
+
+
+@pytest.mark.parametrize(
+    "user_flag", [["-m", "gpt-4o"], ["--model", "gpt-4o"], ["--model=gpt-4o"]]
+)
+def test_launch_args_with_model_respects_user_pinned_model(user_flag: list[str]) -> None:
+    """A model the user pinned via passthrough launch args wins — the override is
+    NOT appended, so the CLI never sees two ``-m`` values."""
+    from omnigent.runner.native.orchestration import _hermes_launch_args_with_model
+
+    out = _hermes_launch_args_with_model(list(user_flag), "anthropic/claude-sonnet-4")
+    assert out == user_flag
+
+
 def test_harness_registry_has_hermes_native() -> None:
     from omnigent.runtime.harnesses import _HARNESS_MODULES
 
