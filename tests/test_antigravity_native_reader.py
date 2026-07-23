@@ -1445,8 +1445,9 @@ async def test_http_error_does_not_crash_loop(
         iterations=3,
     )
 
-    # First poll raised; second poll delivered the message — loop survived.
-    assert steps.calls == 2
+    # Backfill consumed the raise, then the poll loop delivered the message —
+    # loop survived. 3 = one bind-time backfill + two poll iterations.
+    assert steps.calls == 3
     assert sink.item_types() == ["message"]
 
 
@@ -1473,7 +1474,8 @@ async def test_value_error_does_not_crash_loop(
         iterations=3,
     )
 
-    assert steps.calls == 2
+    # 3 = one bind-time backfill + two poll iterations (raise, then recover).
+    assert steps.calls == 3
     assert sink.item_types() == ["message"]
 
 
@@ -3694,8 +3696,9 @@ async def test_supervise_reader_actuates_rotation_when_stream_is_wedged(
 
     Before the fix this would hang (the body ``await``-ed the wedged stream
     directly); the tight :func:`asyncio.wait_for` budget makes a regression fail
-    loudly as a timeout rather than wedging the suite. The poll fallback is never
-    reached (the stream never raises), so its step source is asserted untouched.
+    loudly as a timeout rather than wedging the suite. The poll LOOP is never
+    reached (the stream never raises), so its step source is touched exactly once
+    — by the bind-time backfill, not by any poll iteration.
     """
     new_cascade = "deadlock-1111-2222-3333-444444444444"
     blocking = _BlockingStream()
@@ -3732,9 +3735,10 @@ async def test_supervise_reader_actuates_rotation_when_stream_is_wedged(
 
     assert result == new_cascade
     # The wedged stream was interrupted by cancellation (the actuation path), and
-    # the poll fallback was never reached (the stream never errored).
+    # the poll fallback was never reached (the stream never errored); the single
+    # call is the bind-time backfill, which runs before the stream opens.
     assert blocking.cancelled is True
-    assert poll.calls == 0
+    assert poll.calls == 1
 
 
 @pytest.mark.asyncio
@@ -3782,6 +3786,7 @@ async def test_supervise_reader_external_cancel_propagates_not_rotation(
         await asyncio.wait_for(task, timeout=5)
 
 
+<<<<<<< HEAD
 # ---------------------------------------------------------------------------
 # Quiescence backstop (agy's own CASCADE_RUN_STATUS)
 # ---------------------------------------------------------------------------
@@ -3855,3 +3860,73 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
         )
 
     assert calls == [1], "expected exactly one quiescence signal, after two idle ticks"
+
+
+class _EmptyStream:
+    """A ``stream_agent_state_updates`` that yields no frame and ends cleanly.
+
+    Models the real failure: the reader binds to a cascade whose steps are
+    ALREADY committed, so the connect-stream (which only carries frames minted
+    after it opens) delivers nothing and never errors — meaning the poll
+    fallback, gated on an exception, never runs.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+        self.calls += 1
+
+        async def _gen() -> AsyncIterator[dict[str, object]]:
+            return
+            yield {}  # pragma: no cover  (unreachable; marks this an async gen)
+
+        return _gen()
+
+
+@pytest.mark.asyncio
+async def test_backfill_mirrors_steps_already_committed_at_bind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """Steps that predate the bind are mirrored, even when the stream is silent.
+
+    The regression: an adopt-in-place rebind onto a TUI-minted cascade lands
+    AFTER its steps are committed. The stream carries only post-open frames and
+    never errors, so the poll fallback never fires — leaving the assistant's
+    reply unmirrored and the turn open forever in the web UI. The bind-time
+    backfill must deliver those steps on its own.
+    """
+    text = _load("planner_response_text")
+    steps = _StepScript([[text]])
+    stream = _EmptyStream()
+    sink = _PostSink()
+
+    monkeypatch.setattr(reader, "stream_agent_state_updates", stream)
+    monkeypatch.setattr(reader, "get_trajectory_steps", steps)
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    async def _noop_pending(_cid: str, _port: int, _pending: PendingInteraction) -> None:
+        return None
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    await reader.supervise_reader(
+        _bridge_dir(tmp_path),
+        _SESSION_ID,
+        client=cast(httpx.AsyncClient, object()),
+        on_pending_interaction=cast(Any, _noop_pending),
+        poll_interval_s=0.0,
+        stop=_stop_after(1),
+    )
+
+    # The silent stream opened and returned without error, so the poll loop was
+    # never entered — the single step read is the backfill, and it is what put
+    # the assistant message on the wire.
+    assert stream.calls == 1
+    assert steps.calls == 1
+    assert sink.item_types() == ["message"]

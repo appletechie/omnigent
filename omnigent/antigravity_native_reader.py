@@ -1024,6 +1024,33 @@ async def supervise_reader(
         return should_stop() or bool(rotation_holder)
 
     async def _run_body() -> None:
+        # Backfill BEFORE streaming: the connect-stream only carries frames minted
+        # after it opens, so a bind landing on a cascade whose steps are already
+        # committed — exactly what the adopt-in-place rebind onto a TUI-minted
+        # cascade does — would mirror nothing and leave the turn open forever.
+        # ``state``'s seen-set keeps this idempotent against the stream's own
+        # delivery; a failure is swallowed so the stream/poll paths still run.
+        try:
+            initial_steps = await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+        except (httpx.HTTPError, ValueError) as exc:
+            _logger.warning(
+                "agy RPC reader backfill failed; relying on stream/poll: "
+                "cascade=%s port=%s error=%r",
+                cascade_id,
+                port,
+                exc,
+            )
+        else:
+            for step in initial_steps:
+                await _process_committed_step(
+                    step,
+                    client=client,
+                    session_id=session_id,
+                    cascade_id=cascade_id,
+                    state=state,
+                    on_pending_interaction=on_pending_interaction,
+                )
+
         # STREAM-primary (Task T-D): consume the connect server-stream for live
         # ``output_text_delta`` typing parity. On a stream error (transport
         # ``httpx.HTTPError`` or a connect-trailer ``AntigravityRpcError``) fall
