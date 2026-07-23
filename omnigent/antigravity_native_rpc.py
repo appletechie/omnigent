@@ -57,6 +57,7 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import struct
 import subprocess
 from collections.abc import AsyncIterator, Iterable
@@ -246,6 +247,29 @@ def _async_client(timeout: httpx.Timeout | float) -> httpx.AsyncClient:
     return httpx.AsyncClient(verify=False, timeout=timeout, transport=_ASYNC_HTTP_TRANSPORT)
 
 
+# Absolute fallbacks for the ``lsof`` lookup. A launchd / systemd daemon runs
+# with a minimal PATH — macOS ships lsof in ``/usr/sbin``, which is absent from
+# the omnigent host daemon's PATH, so a bare ``lsof`` argv raises
+# FileNotFoundError and agy's RPC port is never discovered (the reader then
+# never binds and mirrors nothing).
+_LSOF_FALLBACKS = ("/usr/sbin/lsof", "/usr/bin/lsof", "/bin/lsof")
+
+
+def _lsof_binary() -> str | None:
+    """
+    Resolve the ``lsof`` executable independently of the caller's ``PATH``.
+
+    :returns: An executable path, or ``None`` when lsof is unavailable.
+    """
+    found = shutil.which("lsof")
+    if found:
+        return found
+    for candidate in _LSOF_FALLBACKS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _run_lsof_listen_ports(pid: int) -> str:
     """
     Return raw ``lsof`` output listing a pid's TCP LISTEN sockets.
@@ -257,9 +281,13 @@ def _run_lsof_listen_ports(pid: int) -> str:
     :param pid: agy process id, e.g. ``72753``.
     :returns: ``lsof`` stdout, or ``""`` on any failure.
     """
+    binary = _lsof_binary()
+    if binary is None:
+        _logger.warning("lsof not found on PATH or at %s", _LSOF_FALLBACKS)
+        return ""
     try:
         completed = subprocess.run(
-            ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"],
+            [binary, "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             timeout=_LSOF_TIMEOUT_S,

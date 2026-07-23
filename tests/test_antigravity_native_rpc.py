@@ -2078,3 +2078,31 @@ def test_cold_start_port_no_pane_none_when_no_candidates(
     """No pane and no candidates yet → ``None`` (keep polling)."""
     monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", list)
     assert rpc.resolve_cold_start_agy_rpc_port(None, None) is None
+
+
+def test_lsof_binary_falls_back_when_not_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """lsof resolves by absolute path when ``PATH`` does not contain it.
+
+    The regression: the omnigent host daemon runs under launchd/systemd with a
+    minimal PATH. macOS ships lsof in ``/usr/sbin``, which that PATH omits, so a
+    bare ``lsof`` argv raised FileNotFoundError — agy's RPC port was never
+    discovered, the reader never bound, and the session mirrored nothing.
+    """
+    monkeypatch.setattr(rpc.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(rpc.os.path, "isfile", lambda p: p == "/usr/sbin/lsof")
+    monkeypatch.setattr(rpc.os, "access", lambda p, _mode: p == "/usr/sbin/lsof")
+
+    assert rpc._lsof_binary() == "/usr/sbin/lsof"
+
+
+def test_lsof_binary_none_when_absent_everywhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With lsof neither on PATH nor at a known location, resolution yields None.
+
+    ``_run_lsof_listen_ports`` then returns "" and discovery degrades to "no
+    ports" rather than raising.
+    """
+    monkeypatch.setattr(rpc.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(rpc.os.path, "isfile", lambda _p: False)
+
+    assert rpc._lsof_binary() is None
+    assert rpc._run_lsof_listen_ports(1234) == ""
