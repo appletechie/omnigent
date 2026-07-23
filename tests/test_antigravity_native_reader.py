@@ -3236,7 +3236,12 @@ async def _watch_until_cancelled(
     with caplog.at_level(logging.DEBUG, logger=reader.__name__):
         with pytest.raises(asyncio.CancelledError):
             await reader._watch_for_rotation(
-                port=_PORT,
+                state=reader._ReaderState(
+                    allocator=reader._ToolCallIdAllocator(conversation_id=_BOUND_CASCADE),
+                    seen=set(),
+                    interacted=set(),
+                    port=_PORT,
+                ),
                 bound_cascade_id=_BOUND_CASCADE,
                 interval_s=0.0,
                 skip_cascade_ids=frozenset(),
@@ -3846,7 +3851,12 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
 
     with pytest.raises(asyncio.CancelledError):
         await reader._watch_for_rotation(
-            port=_PORT,
+            state=reader._ReaderState(
+                allocator=reader._ToolCallIdAllocator(conversation_id=_BOUND_CASCADE),
+                seen=set(),
+                interacted=set(),
+                port=_PORT,
+            ),
             bound_cascade_id=_BOUND_CASCADE,
             interval_s=0.0,
             skip_cascade_ids=frozenset(),
@@ -3855,3 +3865,56 @@ async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle
         )
 
     assert calls == [1], "expected exactly one quiescence signal, after two idle ticks"
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_reresolves_port_when_agy_rebinds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused poll re-resolves the cascade's port instead of retrying a dead one.
+
+    The regression: the connect-RPC port was resolved once at bind, so when agy
+    rebound its language server onto a new port every poll raised
+    ``ConnectError`` forever and the session mirrored nothing.
+    """
+    dead_port = 58169
+    live_port = 56822
+    seen_ports: list[int] = []
+
+    def _steps(port: int, _cascade_id: str) -> list[dict[str, object]]:
+        seen_ports.append(port)
+        if port != live_port:
+            raise httpx.ConnectError("[Errno 61] Connection refused")
+        return []
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(reader, "_resolve_rpc_port", lambda _cascade_id: live_port)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    state = reader._ReaderState(
+        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+        seen=set(),
+        interacted=set(),
+        port=dead_port,
+    )
+    ticks = iter([False, False, True])
+
+    await asyncio.wait_for(
+        reader._poll_loop(
+            cascade_id=_CASCADE_ID,
+            client=cast(httpx.AsyncClient, object()),
+            session_id=_SESSION_ID,
+            on_pending_interaction=cast(Any, None),
+            state=state,
+            poll_interval_s=0.0,
+            stop=lambda: next(ticks, True),
+        ),
+        timeout=5,
+    )
+
+    assert seen_ports == [dead_port, live_port]
+    assert state.port == live_port

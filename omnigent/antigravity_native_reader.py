@@ -773,7 +773,7 @@ async def _discover(
 
 async def _watch_for_rotation(
     *,
-    port: int,
+    state: _ReaderState,
     bound_cascade_id: str,
     interval_s: float,
     skip_cascade_ids: frozenset[str],
@@ -808,7 +808,8 @@ async def _watch_for_rotation(
     ``httpx.HTTPError`` (e.g. a hung-but-listening port raising ``ReadTimeout``)
     still WARNs because it signals a real fault.
 
-    :param port: Validated connect-RPC port (the bound reader's port).
+    :param state: Per-run shared trackers; ``state.port`` is read each tick so the
+        detector follows the reader when a dead port is re-resolved.
     :param bound_cascade_id: The cascade id the reader is currently bound to.
     :param interval_s: Seconds between rotation checks (kept coarse — a few seconds
         — so the loopback RPC is not hammered).
@@ -826,6 +827,7 @@ async def _watch_for_rotation(
     idle_ticks = 0
     while True:
         await _sleep(interval_s)
+        port = state.port
         try:
             body = await asyncio.to_thread(get_all_cascade_trajectories, port)
         except httpx.ConnectError as exc:
@@ -1052,7 +1054,6 @@ async def supervise_reader(
                 exc,
             )
             await _poll_loop(
-                port=port,
                 cascade_id=cascade_id,
                 client=client,
                 session_id=session_id,
@@ -1069,7 +1070,7 @@ async def supervise_reader(
     # the task is available to cancel (the holder is already populated).
     rotation_task = asyncio.create_task(
         _watch_for_rotation(
-            port=port,
+            state=state,
             bound_cascade_id=cascade_id,
             interval_s=detect_rotation_interval_s,
             skip_cascade_ids=skip_cascade_ids,
@@ -1218,7 +1219,6 @@ class _ReaderState:
 
 async def _poll_loop(
     *,
-    port: int,
     cascade_id: str,
     client: httpx.AsyncClient,
     session_id: str,
@@ -1237,9 +1237,10 @@ async def _poll_loop(
 
     A poll failure — ``httpx.HTTPError`` (transport AND non-2xx) or ``ValueError``
     (a non-JSON 200 body) — is logged and swallowed so a transient fault never
-    kills the loop; the next poll recovers.
+    kills the loop; the next poll recovers. A ``httpx.ConnectError`` means the
+    bound port is dead (agy rebound its connect-RPC server), so the port is
+    re-resolved into ``state`` instead of being retried forever.
 
-    :param port: Validated connect-RPC port.
     :param cascade_id: agy cascade id (equal to the conversation id).
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id to mirror into.
@@ -1251,8 +1252,32 @@ async def _poll_loop(
     :returns: None.
     """
     while not stop():
+        port = state.port
         try:
             steps = await asyncio.to_thread(get_trajectory_steps, port, cascade_id)
+        except httpx.ConnectError as exc:
+            # Connection refused: nothing owns this port any more because agy
+            # rebound its connect-RPC server (language-server restart). Retrying
+            # the dead port would spin forever and mirror nothing, so re-resolve
+            # the cascade's current port before the next poll. A failed
+            # re-resolution just keeps the old port and retries.
+            _logger.warning(
+                "agy RPC reader poll hit a dead port; re-resolving: cascade=%s port=%s error=%r",
+                cascade_id,
+                port,
+                exc,
+            )
+            resolved = await asyncio.to_thread(_resolve_rpc_port, cascade_id)
+            if resolved is not None and resolved != port:
+                _logger.info(
+                    "agy RPC reader rebound to a new port: cascade=%s old_port=%s new_port=%s",
+                    cascade_id,
+                    port,
+                    resolved,
+                )
+                state.port = resolved
+            await _sleep(poll_interval_s)
+            continue
         except httpx.HTTPError as exc:
             _logger.warning(
                 "agy RPC reader poll failed (transport/status); retrying: "
