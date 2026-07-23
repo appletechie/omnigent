@@ -3786,7 +3786,6 @@ async def test_supervise_reader_external_cancel_propagates_not_rotation(
         await asyncio.wait_for(task, timeout=5)
 
 
-<<<<<<< HEAD
 # ---------------------------------------------------------------------------
 # Quiescence backstop (agy's own CASCADE_RUN_STATUS)
 # ---------------------------------------------------------------------------
@@ -3930,3 +3929,59 @@ async def test_backfill_mirrors_steps_already_committed_at_bind(
     assert stream.calls == 1
     assert steps.calls == 1
     assert sink.item_types() == ["message"]
+
+
+@pytest.mark.asyncio
+async def test_stream_idle_deadline_ends_entry_instead_of_wedging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that never yields ends on the idle deadline rather than blocking.
+
+    The regression: while agy is parked it emits neither frame nor trailer, so an
+    unbounded read wedged ``_stream_loop`` forever — the ``stop`` checkpoint was
+    unreachable and the exception-gated poll fallback never fired. The bounded
+    entry must return so the loop can re-check ``stop``.
+    """
+    opened = 0
+
+    def _never_yields(port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+        nonlocal opened
+        opened += 1
+
+        async def _gen() -> AsyncIterator[dict[str, object]]:
+            await asyncio.sleep(3600)  # park like an idle agy
+            yield {}  # pragma: no cover
+
+        return _gen()
+
+    monkeypatch.setattr(reader, "stream_agent_state_updates", _never_yields)
+    monkeypatch.setattr(reader, "_STREAM_IDLE_READ_TIMEOUT_S", 0.05)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    # stop() is False for the first entry, then True — so a working deadline lets
+    # the loop reach its checkpoint and exit. A wedge would hang until the timeout.
+    ticks = iter([False, True, True])
+
+    await asyncio.wait_for(
+        reader._stream_loop(
+            port=1234,
+            cascade_id=_CASCADE_ID,
+            client=cast(httpx.AsyncClient, object()),
+            session_id=_SESSION_ID,
+            on_pending_interaction=cast(Any, None),
+            state=reader._ReaderState(
+                allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
+                seen=set(),
+                interacted=set(),
+                port=_PORT,
+            ),
+            stop=lambda: next(ticks, True),
+        ),
+        timeout=5,
+    )
+
+    assert opened >= 1

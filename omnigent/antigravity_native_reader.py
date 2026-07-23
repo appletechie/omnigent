@@ -122,6 +122,11 @@ _DEFAULT_ROTATION_INTERVAL_S = 3.0
 # stream at zero delay and pin a CPU — the poll fallback only triggers on an
 # exception, never a clean immediate return.
 _STREAM_REENTRY_BACKOFF_S = 0.5
+# Idle read deadline for ONE stream entry. While agy is parked it emits neither a
+# frame nor a trailer, so an unbounded read wedges the body: the ``stop``
+# checkpoint is unreachable and the exception-gated poll fallback never fires.
+# Bounding each entry makes the loop periodically re-checkable without churn.
+_STREAM_IDLE_READ_TIMEOUT_S = 30.0
 
 # Teardown drain passes for the interaction bridge + chained re-scan tasks. Cancelling
 # a bridge stops it scheduling a re-scan and vice versa, so the chain collapses fast;
@@ -1369,7 +1374,25 @@ async def _stream_loop(
         falls back).
     """
     while not stop():
-        async for frame in stream_agent_state_updates(port, cascade_id):
+        frames = stream_agent_state_updates(port, cascade_id).__aiter__()
+        while True:
+            try:
+                frame = await asyncio.wait_for(
+                    frames.__anext__(), timeout=_STREAM_IDLE_READ_TIMEOUT_S
+                )
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                # Idle deadline. agy parked with no frame and no trailer, so a
+                # deadline-less read would block here forever: the loop's ``stop``
+                # checkpoint is never reached and the poll fallback (gated on an
+                # exception) never runs. End this entry so the outer loop re-checks
+                # ``stop`` and re-opens; close the generator to free the response.
+                aclose = getattr(frames, "aclose", None)
+                if aclose is not None:
+                    with contextlib.suppress(Exception):
+                        await aclose()
+                break
             # NOTE on /clear rotation: this stream is bound to ONE cascade and only
             # ever reports THAT cascade's id, so it can NEVER observe a sibling
             # conversation — a per-frame "did the conversation change?" guard here
