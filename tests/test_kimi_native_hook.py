@@ -189,6 +189,53 @@ def test_permission_request_injects_keystroke_for_verdict(
     assert keys == [expected_key]
 
 
+def test_permission_request_elicitation_id_is_stable_per_tool_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-fired hook re-parks the same elicitation; distinct calls stay distinct."""
+    bridge_dir = _governed_bridge(tmp_path)
+    ids: list[str] = []
+
+    def _capture(url: object, headers: object, body: dict[str, object]) -> None:
+        ids.append(body["_omnigent_elicitation_id"])
+        return
+
+    monkeypatch.setattr(kimi_native_hook, "_request_web_approval", _capture)
+    _capture_injection(monkeypatch)
+
+    for call_id in ("tc_1", "tc_1", "tc_2"):
+        _feed_stdin(
+            monkeypatch,
+            {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_call_id": call_id},
+        )
+        assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+
+    assert ids[0] == ids[1], "same tool_call_id must re-park the same elicitation"
+    assert ids[2] != ids[0], "a different tool_call_id must be a distinct elicitation"
+
+
+def test_permission_request_elicitation_id_random_without_call_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No tool_call_id → fall back to a random id (old behaviour preserved)."""
+    bridge_dir = _governed_bridge(tmp_path)
+    ids: list[str] = []
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "_request_web_approval",
+        lambda url, headers, body: ids.append(body["_omnigent_elicitation_id"]) or None,
+    )
+    _capture_injection(monkeypatch)
+
+    for _ in range(2):
+        _feed_stdin(monkeypatch, {"hook_event_name": "PermissionRequest", "tool_name": "Bash"})
+        assert kimi_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)]) == 0
+
+    assert ids[0] != ids[1], "absent a call id, each request is its own elicitation"
+
+
 def test_permission_request_no_verdict_injects_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

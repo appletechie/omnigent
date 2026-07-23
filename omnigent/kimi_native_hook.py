@@ -222,11 +222,23 @@ def _main_permission_request(argv: list[str]) -> int:
     tool_name = payload.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name:
         return 0
+    # Re-attach id keyed on kimi's per-tool-call id so a hook re-fired after a
+    # severed long-poll (reconnect / transient 5xx) re-parks the SAME server
+    # elicitation and picks up a verdict answered while it was disconnected —
+    # rather than minting a fresh card and orphaning the one the human answered,
+    # which leaves kimi's TUI menu parked forever. Unlike claude-native (whose
+    # hook blocks and is invoked once), kimi fires PermissionRequest
+    # fire-and-forget and can re-fire, so a random-per-call id defeats re-attach.
+    # A distinct call id keeps distinct approvals distinct; fall back to a random
+    # id only when kimi omits the call id, preserving the old behaviour.
+    tool_call_id = payload.get("tool_call_id")
+    if isinstance(tool_call_id, str) and tool_call_id:
+        elicitation_id = f"elicit_kimi_{session_id}_{tool_call_id}"
+    else:
+        elicitation_id = f"elicit_kimi_{secrets.token_hex(16)}"
     body: dict[str, object] = {
         "tool_name": tool_name,
-        # Stable re-attach id so a severed long-poll re-parks the SAME
-        # elicitation (mirrors the claude permission hook).
-        "_omnigent_elicitation_id": f"elicit_kimi_{secrets.token_hex(16)}",
+        "_omnigent_elicitation_id": elicitation_id,
     }
     tool_input = payload.get("tool_input")
     if isinstance(tool_input, dict):
