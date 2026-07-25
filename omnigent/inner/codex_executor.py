@@ -688,7 +688,12 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
-def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
+def _populate_codex_home_config(
+    target_dir: Path,
+    source_dir: Path,
+    *,
+    minimal_config: bool | None = None,
+) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
 
@@ -713,15 +718,18 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     :param source_dir: The primary ``CODEX_HOME`` directory
         (typically ``$CODEX_HOME`` or ``~/.codex``). Missing files are
         skipped.
+    :param minimal_config: Copy only auth and provider-routing config when
+        ``True``. ``None`` preserves the environment-controlled behavior.
     """
     if not source_dir.is_dir():
         return
 
-    minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    if minimal_config is None:
+        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
     symlink_files = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
@@ -1042,6 +1050,25 @@ def _extract_latest_user_content(
                 return content
             return json.dumps(content)
     return ""
+
+
+def _goal_objective_from_content(content: str | list[dict[str, Any]]) -> str | None:
+    """Return the objective from a standalone ``/goal`` user command."""
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for block in content:
+            if block.get("type") not in {"input_text", "text"}:
+                return None
+            text = block.get("text")
+            if not isinstance(text, str):
+                return None
+            text_parts.append(text)
+        content = "".join(text_parts)
+    command, separator, objective = content.strip().partition(" ")
+    if command != "/goal" or not separator:
+        return None
+    objective = objective.strip()
+    return objective or None
 
 
 def _build_initial_prompt(
@@ -1573,7 +1600,25 @@ class _CodexAppServerSession:
             self._applied_effort = None
 
         assert self.thread_id is not None
-        prompt = _prompt_for_turn(messages, is_new_thread=is_new_thread)
+        latest_user_content = _extract_latest_user_content(messages)
+        goal_objective = _goal_objective_from_content(latest_user_content)
+        prompt_messages = messages
+        if goal_objective is not None:
+            await self._request(
+                "thread/goal/set",
+                {
+                    "threadId": self.thread_id,
+                    "objective": goal_objective,
+                },
+            )
+            # A reset thread still needs prior history, with the command
+            # replaced by the clean objective sent to Codex.
+            prompt_messages = [message.copy() for message in messages]
+            for message in reversed(prompt_messages):
+                if message.get("role") == "user":
+                    message["content"] = goal_objective
+                    break
+        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:

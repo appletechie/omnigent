@@ -5,7 +5,8 @@
 // yearly BYMONTH), plus the 1-hour-floor validation.
 
 import { describe, expect, it } from "vitest";
-import { describeSchedule, formatClockTime, nextRunAtMs } from "./scheduleText";
+import { RRule, rrulestr } from "rrule";
+import { describeSchedule, formatClockTime, formatNextRunAt, nextRunAtMs } from "./scheduleText";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
@@ -16,6 +17,15 @@ import {
 /** Convenience: a model with overrides on top of the default. */
 function model(overrides: Partial<ScheduleModel>): ScheduleModel {
   return { ...DEFAULT_SCHEDULE_MODEL, ...overrides };
+}
+
+const REFERENCE_OCCURRENCE_ANCHOR = new Date(Date.UTC(2000, 0, 1, 0, 0, 0));
+
+function referenceNextRunAtMs(rrule: string, now: Date): number | null {
+  const parsed = rrulestr(rrule);
+  if (!(parsed instanceof RRule)) return null;
+  const rule = new RRule({ ...parsed.origOptions, dtstart: REFERENCE_OCCURRENCE_ANCHOR });
+  return rule.after(now, false)?.getTime() ?? null;
 }
 
 describe("formatClockTime", () => {
@@ -318,5 +328,76 @@ describe("nextRunAtMs", () => {
 
   it("returns null for an unparseable rule", () => {
     expect(nextRunAtMs("garbage", "UTC")).toBeNull();
+  });
+
+  it.each([
+    "FREQ=HOURLY;BYMINUTE=3",
+    "FREQ=HOURLY;INTERVAL=3",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    "FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=8",
+    "FREQ=DAILY;INTERVAL=3",
+    "FREQ=MONTHLY;BYMONTHDAY=15",
+    "FREQ=YEARLY;BYMONTH=3",
+  ])("matches the deterministic 2000-anchor result for %s", (rrule) => {
+    const now = new Date("2026-07-24T05:00:00Z");
+    expect(nextRunAtMs(rrule, "UTC", now)).toBe(referenceNextRunAtMs(rrule, now));
+  });
+
+  it("computes hourly next-run values without iterating from the 2000 anchor", () => {
+    const start = performance.now();
+    const next = nextRunAtMs("FREQ=HOURLY;BYMINUTE=30", "UTC", new Date("2026-07-24T05:00:00Z"));
+    const elapsedMs = performance.now() - start;
+
+    expect(next).not.toBeNull();
+    expect(elapsedMs).toBeLessThan(30);
+  });
+});
+
+describe("formatNextRunAt (compact relative delta from the server's next-run)", () => {
+  // A fixed "now" so the delta buckets are deterministic.
+  const NOW = new Date("2026-03-10T12:00:00Z"); // Tue 2026-03-10, 12:00 UTC
+  const iso = (ms: number) => new Date(NOW.getTime() + ms).toISOString();
+  const MIN = 60_000;
+  const HR = 60 * MIN;
+  const DAY = 24 * HR;
+
+  it("returns null for null / empty / unparseable input", () => {
+    expect(formatNextRunAt(null, NOW)).toBeNull();
+    expect(formatNextRunAt(undefined, NOW)).toBeNull();
+    expect(formatNextRunAt("", NOW)).toBeNull();
+    expect(formatNextRunAt("not-a-date", NOW)).toBeNull();
+  });
+
+  it("formats a sub-hour delta in minutes (floor)", () => {
+    expect(formatNextRunAt(iso(30 * MIN), NOW)).toBe("in 30m");
+    // Floor: 59m59s → "in 59m".
+    expect(formatNextRunAt(iso(59 * MIN + 59_000), NOW)).toBe("in 59m");
+    // Minimum bucket is 1m (just over the 'soon' threshold).
+    expect(formatNextRunAt(iso(MIN), NOW)).toBe("in 1m");
+  });
+
+  it("formats a sub-day delta in hours (floor)", () => {
+    expect(formatNextRunAt(iso(HR), NOW)).toBe("in 1h");
+    expect(formatNextRunAt(iso(15 * HR), NOW)).toBe("in 15h");
+    // Floor: 23h59m → "in 23h".
+    expect(formatNextRunAt(iso(23 * HR + 59 * MIN), NOW)).toBe("in 23h");
+  });
+
+  it("formats a multi-day delta in days (floor)", () => {
+    expect(formatNextRunAt(iso(DAY), NOW)).toBe("in 1d");
+    expect(formatNextRunAt(iso(6 * DAY), NOW)).toBe("in 6d");
+    // Floor: 6d23h → "in 6d".
+    expect(formatNextRunAt(iso(6 * DAY + 23 * HR), NOW)).toBe("in 6d");
+  });
+
+  it("returns 'soon' for an imminent or just-passed delta (< 1 minute)", () => {
+    expect(formatNextRunAt(iso(20_000), NOW)).toBe("soon"); // 20s out
+    expect(formatNextRunAt(iso(0), NOW)).toBe("soon"); // exactly now
+    expect(formatNextRunAt(iso(-5 * MIN), NOW)).toBe("soon"); // 5m in the past (skew)
+  });
+
+  it("bucket boundaries: 60m → hours, 24h → days", () => {
+    expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1h");
+    expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1d");
   });
 });

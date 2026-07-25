@@ -40,7 +40,6 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
-  PlusIcon,
   SearchIcon,
   SettingsIcon,
   ShareIcon,
@@ -64,6 +63,7 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
+import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
@@ -108,7 +108,10 @@ import {
   useDeleteProject,
   useRenameProject,
   PROJECT_LABEL_KEY,
-  usePinnedConversationBackfill,
+  PINNED_CONVERSATIONS_KEY,
+  usePinnedConversations,
+  useTogglePinnedConversation,
+  setConversationPinned,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -152,13 +155,11 @@ import {
   dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
   migratePinnedConversationIds,
-  normalizePinnedConversationIds,
-  orderByPinnedSequence,
+  orderByPinnedTimestamp,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
   resolveSidebarDrop,
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
-  togglePinnedConversationId,
 } from "./sidebarNav";
 
 // Positioning for a row's trailing session-state badge. On desktop the badge
@@ -304,8 +305,77 @@ function showArchivedToast() {
   showToast(<ArchivedToast />);
 }
 
+/**
+ * One-time migration of localStorage pins to server-side labels.
+ *
+ * Pins used to live only in `localStorage` under
+ * `PINNED_CONVERSATION_IDS_STORAGE_KEY`. Now they're an `omnigent.pinned`
+ * session label so they follow the user across devices. On the first mount
+ * after this ships, push any still-local pins the server doesn't already know
+ * about (as the label) so no one loses their existing pins, then clear the
+ * legacy key so this runs at most once.
+ *
+ * Waits for the server pinned set to load (`pinnedLoaded`) so an id the server
+ * already has isn't needlessly re-PATCHed. Runs the writes directly rather than
+ * through the mutation hook: this fires once before any user interaction, and it
+ * patches the pinned-list cache itself with the confirmed rows (below) — the
+ * same cache-patch (not invalidate) strategy `useTogglePinnedConversation` uses,
+ * since the `?pinned=true` index lags these writes.
+ *
+ * @param serverPinnedIds - Ids the server already reports as pinned.
+ * @param pinnedLoaded - Whether the server pinned query has settled.
+ */
+function useMigrateLocalPinsToServer(serverPinnedIds: Set<string>, pinnedLoaded: boolean): void {
+  const queryClient = useQueryClient();
+  const migratedRef = useRef(false);
+  useEffect(() => {
+    if (!pinnedLoaded || migratedRef.current) return;
+    migratedRef.current = true;
+    const legacyIds = readPinnedConversationIds();
+    const toMigrate = legacyIds.filter((id) => !serverPinnedIds.has(id));
+    // Ids the server already owns can be dropped from the legacy key right away;
+    // ids still to migrate stay until their write succeeds (below), so a failed
+    // or offline write retries next load instead of losing the pin.
+    if (toMigrate.length === 0) {
+      clearLegacyPinnedConversationIds();
+      return;
+    }
+    writeLegacyPinnedConversationIds(toMigrate);
+    void (async () => {
+      // Legacy localStorage kept pins most-recently-pinned-first, so preserve
+      // that order by synthesizing descending pin timestamps: the oldest pin
+      // (last in the list) gets the smallest value and stays at the top of the
+      // Pinned section, matching the pre-migration ordering.
+      const now = Date.now();
+      const results = await Promise.all(
+        toMigrate.map((id, i) =>
+          setConversationPinned(id, true, now - i)
+            .then((conv) => ({ id, conv }))
+            .catch(() => ({ id, conv: null as Conversation | null })),
+        ),
+      );
+      // Keep only the ids whose write failed in the legacy key, so the next
+      // load retries them; drop the succeeded ones (now server-owned).
+      const failedIds = results.filter((r) => r.conv === null).map((r) => r.id);
+      writeLegacyPinnedConversationIds(failedIds);
+      // Patch the pinned-list cache with the confirmed rows rather than
+      // invalidating — the `?pinned=true` index lags these writes, so a refetch
+      // here would momentarily drop the just-migrated pins.
+      const rows = results.map((r) => r.conv).filter((c): c is Conversation => c != null);
+      if (rows.length > 0) {
+        queryClient.setQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY, (old) => {
+          const ids = new Set(rows.map((c) => c.id));
+          return [...(old ?? []).filter((c) => !ids.has(c.id)), ...rows];
+        });
+      }
+    })();
+    // Run once after the pinned set loads; serverPinnedIds is captured at that
+    // point and the ref guard prevents re-entry.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pinnedLoaded]);
+}
+
 export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
-  const [pinnedConversationIds, setPinnedConversationIds] = useState(readPinnedConversationIds);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // Which session tab is shown. "mine" (default) keeps the full Pinned /
@@ -411,17 +481,32 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // the sidebar stays mounted across the transition into settings.
   useTrackSettingsReturn();
 
-  // Sync pinned ids to localStorage whenever state changes. Keeping
-  // the write here (instead of inside the state updater) preserves the
-  // purity contract of React updaters — important under StrictMode,
-  // which may invoke updaters twice.
-  useEffect(() => {
-    writePinnedConversationIds(pinnedConversationIds);
-  }, [pinnedConversationIds]);
+  // Pins are stored on the server as an `omnigent.pinned` session label, so
+  // they follow the user across devices. `usePinnedConversations` is the
+  // authoritative pinned set (independent of the paginated window); the toggle
+  // mutation flips the label and refreshes that query.
+  const { data: pinnedConversations = [], isSuccess: pinnedLoaded } = usePinnedConversations();
+  const pinnedConversationIds = useMemo(
+    () => pinnedConversations.map((c) => c.id),
+    [pinnedConversations],
+  );
+  const togglePinnedMutation = useTogglePinnedConversation();
+  const pinnedIdSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
+  const togglePinnedConversation = useCallback(
+    (conversationId: string) => {
+      togglePinnedMutation.mutate({
+        id: conversationId,
+        pinned: !pinnedIdSet.has(conversationId),
+      });
+    },
+    [togglePinnedMutation, pinnedIdSet],
+  );
 
-  const togglePinnedConversation = useCallback((conversationId: string) => {
-    setPinnedConversationIds((prev) => togglePinnedConversationId(prev, conversationId));
-  }, []);
+  // One-time migration: pins used to live only in localStorage. Push any
+  // still-local pins up to the server (as the `omnigent.pinned` label) the
+  // first time this build runs, so no one loses their existing pins, then
+  // clear the legacy key so this runs at most once.
+  useMigrateLocalPinsToServer(pinnedIdSet, pinnedLoaded);
 
   // Desktop-only drag-to-resize, mirroring the right rail. The width is
   // exposed as a CSS variable consumed by the ``md:w-[var(--sidebar-width)]``
@@ -615,9 +700,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             <Button
               asChild
               className={cn(
-                // Same shared nav-row construct as "New session" / "Inbox" /
-                // "Select sessions" so the active-pill, hover, insets, icon
-                // column, and text weight all match post-refactor.
+                // Same shared nav-row construct as "New session" / "Inbox" so
+                // the active-pill, hover, insets, icon column, and text weight
+                // all match post-refactor.
                 "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] px-2 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -669,20 +754,6 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     )}
                   </Link>
                 </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  aria-label="Select sessions"
-                  data-testid="toggle-selection-mode"
-                  className={cn(
-                    "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
-                    SIDEBAR_HOVER_HIGHLIGHT,
-                  )}
-                  onClick={() => setSelectionMode(true)}
-                >
-                  <ListChecksIcon className="size-3.5 text-muted-foreground" />
-                  Select sessions
-                </Button>
               </>
             )}
           </div>
@@ -721,12 +792,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
           <nav
             ref={scrollContainerRef}
-            // `stable both-edges` reserves the scrollbar gutter symmetrically
-            // (left + right) so rows stay centered and content never reflows
-            // when the scrollbar appears/disappears — on classic-scrollbar
-            // platforms as well as overlay ones. Plain `stable` (right-only)
-            // left rows visually off-center against the left `px-2` inset.
-            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-gutter:stable_both-edges]"
+            // Keep wheel/touch scrolling without letting classic-scrollbar
+            // platforms reserve a wide, permanently visible Sidebar gutter.
+            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -735,8 +803,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               searchQuery=""
               activeTab={multiUser ? activeTab : "mine"}
               pinnedConversationIds={pinnedConversationIds}
-              onPinnedConversationIdsChange={setPinnedConversationIds}
+              pinnedConversations={pinnedConversations}
               onTogglePinned={togglePinnedConversation}
+              onEnterSelectionMode={() => setSelectionMode(true)}
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
@@ -948,8 +1017,11 @@ interface ConversationListProps {
   searchQuery: string;
   activeTab: SidebarTab;
   pinnedConversationIds: string[];
-  onPinnedConversationIdsChange: (ids: string[]) => void;
+  // The server-authoritative pinned sessions, so a pinned session that sits
+  // outside the loaded pagination window still renders in the Pinned section.
+  pinnedConversations: Conversation[];
   onTogglePinned: (conversationId: string) => void;
+  onEnterSelectionMode: () => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
@@ -1009,8 +1081,9 @@ function ConversationList({
   searchQuery,
   activeTab,
   pinnedConversationIds,
-  onPinnedConversationIdsChange,
+  pinnedConversations,
   onTogglePinned,
+  onEnterSelectionMode,
   selectionMode,
   selectedIds,
   onToggleSelected,
@@ -1027,8 +1100,8 @@ function ConversationList({
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
-  // All loaded conversations from the single paginated list (for pinned
-  // backfill, normalization, and the flat session list).
+  // All loaded conversations from the single paginated list (for the flat
+  // session list; pinned rows are merged in from the server pinned query).
   const allConversations = useMemo(
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
@@ -1053,10 +1126,6 @@ function ConversationList({
   // order, not the global paginated list which can diverge.
   const projectRenderedIdsRef = useRef<Map<string, string[]>>(new Map());
 
-  // Backfill pinned sessions that aren't in the loaded set.
-  const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
-  const pinnedBackfill = usePinnedConversationBackfill(pinnedConversationIds, loadedIds);
-
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
   // out from under you. Snapshot is dropped on navigate-away so the
@@ -1073,10 +1142,11 @@ function ConversationList({
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
-    // Dedupe by id: the pinned-backfill can return a session already present in
-    // the paginated list, and merging both would render the row twice.
-    const allWithBackfill = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
-    const notArchived = allWithBackfill.filter((c) => c.archived !== true);
+    // Merge the server pinned set in, so a pinned session outside the loaded
+    // paginated window still renders. Dedupe by id: a pinned session is usually
+    // also present in the paginated list, and merging both would render it twice.
+    const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
+    const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
     // "shared" is the ones others shared with them. The Pinned / Projects /
     // Sessions structure is then built from that slice, so both tabs reuse the
@@ -1088,14 +1158,12 @@ function ConversationList({
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
-    // strictly by when they were pinned (newest pin at the bottom), not by
-    // `updated_at`, so a pinned session doesn't jump when it gets a new message.
-    // Pins are localStorage and ownership-agnostic, so a pinned shared session
-    // floats to Pinned on the Shared tab just like an owned one on My sessions.
-    const pinned = orderByPinnedSequence(
-      tabScoped.filter((c) => pinnedSet.has(c.id)),
-      pinnedConversationIds,
-    );
+    // by when they were pinned (the `omnigent.pinned` label's epoch-ms value;
+    // oldest pin at the top, newest at the bottom), NOT by `updated_at`, so a
+    // pinned session holds its slot when a new message bumps its `updated_at`.
+    // Pins are ownership-agnostic, so a pinned shared session floats to Pinned
+    // on the Shared tab just like an owned one on My sessions.
+    const pinned = orderByPinnedTimestamp(tabScoped.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
     // Projects are a "My sessions"-only tool (filing into a project is
@@ -1130,15 +1198,14 @@ function ConversationList({
       activeOverride,
     );
     const archived = sortByUpdatedAtDesc(
-      allWithBackfill.filter((c) => c.archived === true),
+      allWithPinned.filter((c) => c.archived === true),
       activeOverride,
     );
     return { pinned, sessions, archived, projectGroups };
   }, [
     allConversations,
-    pinnedBackfill,
+    pinnedConversations,
     pinnedSet,
-    pinnedConversationIds,
     activeOverride,
     projects,
     activeTab,
@@ -1417,27 +1484,12 @@ function ConversationList({
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
 
-  // Only normalize pinned ids once all pages are loaded; a pin that
-  // lives on an unloaded page should not be dropped prematurely
-  // (the backfill covers it in the meantime).
+  // Pinned membership is server-authoritative (the `omnigent.pinned` label),
+  // so there's no client-side list to normalize against the loaded window —
+  // the pinned query returns exactly the pinned sessions, unpinning removes the
+  // label, and a deleted session drops out of the query on the server.
   const hasMorePages = conversationsQuery.hasNextPage;
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
-  useEffect(() => {
-    if (!conversationsQuery.data || hasMorePages || searchQuery) return;
-    const allLoaded = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
-    const normalized = normalizePinnedConversationIds(pinnedConversationIds, allLoaded);
-    if (!sameStringArray(normalized, pinnedConversationIds)) {
-      onPinnedConversationIdsChange(normalized);
-    }
-  }, [
-    conversationsQuery.data,
-    hasMorePages,
-    searchQuery,
-    allConversations,
-    pinnedBackfill,
-    pinnedConversationIds,
-    onPinnedConversationIdsChange,
-  ]);
 
   if (conversationsQuery.isLoading) {
     return <p className="px-2 py-1 text-muted-foreground text-xs">Loading…</p>;
@@ -1655,6 +1707,28 @@ function ConversationList({
                     selectedIds={selectedIds}
                     onToggleSelected={onToggleSelected}
                     onProjectAssigned={expandProject}
+                    headerAction={
+                      !selectionMode ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              aria-label="Select sessions"
+                              data-testid="toggle-selection-mode"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onEnterSelectionMode();
+                              }}
+                            >
+                              <ListChecksIcon className="size-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom">Select sessions</TooltipContent>
+                        </Tooltip>
+                      ) : undefined
+                    }
                   />
                 </ChatsDropZone>
               )}
@@ -2422,7 +2496,7 @@ function SessionTooltipContent({
       sideOffset={8}
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
-      // then a muted, small-icon metadata line.
+      // then muted, small-icon metadata lines.
       className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-md ring-1 ring-foreground/10"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
@@ -2439,6 +2513,15 @@ function SessionTooltipContent({
         <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
         <span className="truncate">{locationLabel}</span>
       </p>
+      {conversation.git_branch && (
+        <p
+          data-testid="session-tooltip-branch"
+          className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+        >
+          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{conversation.git_branch}</span>
+        </p>
+      )}
     </TooltipContent>
   );
 }
@@ -2776,12 +2859,19 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "sidebar-compact-text relative flex min-h-7 flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
+        "sidebar-compact-text relative flex h-7 flex-col justify-center rounded-[var(--radius-otto-sm)] py-0.5 pl-2 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
-        !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-14"),
+        !selectionMode &&
+          (sessionState?.kind === "awaiting"
+            ? "pr-48 md:pr-29"
+            : sessionState !== null
+              ? "pr-28 md:pr-8"
+              : "pr-28 md:pr-2"),
+        !selectionMode && "md:group-hover:pr-14 md:group-focus-within:pr-14",
+        !selectionMode && menuOpen && "md:pr-14",
         selectionMode && "pr-10",
         isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -2818,16 +2908,6 @@ function ConversationRow({
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
-      {/* Row 2: git branch subtitle, spanning the full row below. */}
-      {gitBranch !== null && (
-        <span
-          className="flex items-center gap-1 font-normal text-xs text-muted-foreground"
-          title={gitBranch}
-        >
-          <GitBranchIcon className="size-3 shrink-0" />
-          <span className="truncate">{gitBranch}</span>
-        </span>
-      )}
     </Link>
   );
 
@@ -2855,6 +2935,7 @@ function ConversationRow({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
+              gitBranch={gitBranch}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -2882,6 +2963,7 @@ function ConversationRow({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
+            gitBranch={gitBranch}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -3135,16 +3217,18 @@ function ConversationRow({
  *
  * Pinning lifts a session out of its project folder into the flat "Pinned"
  * section, dropping the visual project cue the folder provided. Hovering the
- * row surfaces it again: the session title, then a folder icon + project name.
+ * row surfaces it again: the session title, project name, and optional branch.
  * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
  * and the muted, small-icon foreground used elsewhere in the sidebar.
  */
 function PinnedProjectFlyoutContent({
   title,
   projectName,
+  gitBranch,
 }: {
   title: string;
   projectName: string;
+  gitBranch: string | null;
 }) {
   return (
     <HoverCardContent
@@ -3162,6 +3246,15 @@ function PinnedProjectFlyoutContent({
         <FolderIcon className="size-3.5 shrink-0" />
         <span className="truncate">{projectName}</span>
       </p>
+      {gitBranch && (
+        <p
+          data-testid="pinned-project-flyout-branch"
+          className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+        >
+          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{gitBranch}</span>
+        </p>
+      )}
     </HoverCardContent>
   );
 }
@@ -3518,26 +3611,10 @@ function ProjectPickerMenu({
 }) {
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
-  const [creatingNew, setCreatingNew] = useState(false);
-  const [newProjectName, setNewProjectName] = useState("");
-  const newInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (creatingNew) {
-      newInputRef.current?.focus();
-    }
-  }, [creatingNew]);
 
   const filtered = search
     ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
-
-  function handleNewProjectCommit() {
-    const name = newProjectName.trim();
-    setCreatingNew(false);
-    setNewProjectName("");
-    if (name) onSelect(name);
-  }
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -3566,54 +3643,20 @@ function ProjectPickerMenu({
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && !creatingNew && (
+        {filtered.length === 0 && (
           <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
         )}
       </div>
-      <div className="border-t pt-1">
-        {creatingNew ? (
-          <div className="flex items-center gap-1 px-2 py-1">
-            <input
-              ref={newInputRef}
-              className="flex-1 bg-transparent text-xs outline-none"
-              placeholder="Project name…"
-              value={newProjectName}
-              onChange={(e) => setNewProjectName(e.target.value)}
-              onKeyDown={(e) => {
-                e.stopPropagation();
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleNewProjectCommit();
-                }
-                if (e.key === "Escape") {
-                  setCreatingNew(false);
-                  setNewProjectName("");
-                }
-              }}
-            />
-          </div>
-        ) : (
-          <C.Item
-            className="px-2 py-1"
-            // Keep the menu open so the inline input can take over in place.
-            onSelect={(e) => {
-              e.preventDefault();
-              setCreatingNew(true);
-            }}
-          >
-            <PlusIcon className="size-3.5 shrink-0" />
-            Create new project
-          </C.Item>
-        )}
-        {currentProject && (
+      {currentProject && (
+        <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
             </span>
           </C.Item>
-        )}
-      </div>
+        </div>
+      )}
     </>
   );
 }
@@ -3989,13 +4032,29 @@ function readPinnedConversationIds(): string[] {
   }
 }
 
-function writePinnedConversationIds(ids: string[]) {
+function clearLegacyPinnedConversationIds() {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
+    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
   } catch {
-    // Pinning is a local navigation preference; storage failures should not
-    // make the sidebar unusable.
+    // Best-effort cleanup — leaving the stale key is harmless (the migration
+    // guard skips already-pinned ids), so a failure here needn't surface.
+  }
+}
+
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Used by the
+// migration to retain only the pins whose server write failed, so a transient
+// failure retries on the next load instead of dropping the pin.
+function writeLegacyPinnedConversationIds(ids: string[]) {
+  if (typeof window === "undefined") return;
+  try {
+    if (ids.length === 0) {
+      window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
+    }
+  } catch {
+    // Best-effort — a write failure just means the migration retries next load.
   }
 }
 
@@ -4051,8 +4110,4 @@ function writeExpandedProjectSections(names: string[]) {
   } catch {
     // Same as collapse state — a lost local preference is harmless.
   }
-}
-
-function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
 }

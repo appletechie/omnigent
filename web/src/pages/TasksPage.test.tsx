@@ -18,6 +18,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
+  useRunScheduledTaskNow: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only
@@ -28,16 +29,20 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     open,
     initialName,
     initialPrompt,
+    editingTask,
   }: {
     open: boolean;
     initialName?: string;
     initialPrompt?: string;
+    editingTask?: ScheduledTask | null;
   }) =>
     open ? (
       <div
         data-testid="manual-dialog-open"
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
+        data-editing-task-id={editingTask?.id ?? ""}
+        data-editing-task-name={editingTask?.name ?? ""}
       />
     ) : null,
 }));
@@ -59,13 +64,16 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     hostId: null,
     state: "active",
     lastRunAt: null,
+    lastRunStatus: null,
     lastRunConversationId: null,
+    nextRunAt: null,
     ...overrides,
   };
 }
 
 const mutate = vi.fn();
 const deleteMutate = vi.fn();
+const runNowMutate = vi.fn();
 
 function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?: boolean } = {}) {
   vi.mocked(hooks.useScheduledTasks).mockReturnValue({
@@ -79,6 +87,7 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
 beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
+  runNowMutate.mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
     isPending: false,
@@ -89,6 +98,11 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useDeleteScheduledTask>);
+  vi.mocked(hooks.useRunScheduledTaskNow).mockReturnValue({
+    mutate: runNowMutate,
+    isPending: false,
+    variables: undefined,
+  } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
 });
 
 afterEach(() => cleanup());
@@ -334,6 +348,17 @@ describe("suggestion prefill", () => {
 });
 
 describe("row actions", () => {
+  it("opens edit mode for a task from the row menu", () => {
+    setTasks([task({ id: "st_edit", name: "Morning brief" })]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("task-edit"));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog.getAttribute("data-editing-task-id")).toBe("st_edit");
+    expect(dialog.getAttribute("data-editing-task-name")).toBe("Morning brief");
+    expect(dialog.getAttribute("data-initial-name")).toBe("");
+  });
+
   it("pauses an active task via the row menu (Pause label reflects state)", () => {
     setTasks([task({ id: "st_1", state: "active" })]);
     renderPage();
