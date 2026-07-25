@@ -2,8 +2,14 @@
 # so a merge/sync auto-publishes ghcr.io/apple-techie/omnigent-server with no
 # manual `docker push`. dokploy-root pulls it anonymously (the package is
 # public). Not an upstream workflow — additive, so upstream merges never touch
-# it. See .github/workflows/oss-publish-images.yml for the upstream analogue
-# (different namespace, tag-triggered).
+# it.
+#
+# Auth: the GHCR_PAT repo secret, NOT the built-in GITHUB_TOKEN. This repo is a
+# fork, and GitHub excludes forks from a package's Actions-access list (and the
+# source-repo inherit path doesn't grant it either), so GITHUB_TOKEN can never
+# push to this account-owned package. A user PAT authenticates as the account
+# and pushes regardless — set once as a secret, automatic forever. Scope the PAT
+# to packages write only.
 name: Publish deploy image
 
 on:
@@ -16,9 +22,10 @@ concurrency:
   group: deploy-image-${{ github.ref }}
   cancel-in-progress: true
 
+# Only checkout access is needed from GITHUB_TOKEN; the GHCR push authenticates
+# with the GHCR_PAT secret, not GITHUB_TOKEN.
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build-and-push:
@@ -34,14 +41,16 @@ jobs:
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
 
       - name: Compute tags
         id: tags
+        env:
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/apple-techie/omnigent-server"
+          IMAGE="ghcr.io/${OWNER}/omnigent-server"
           SHORT_SHA="$(git rev-parse --short HEAD)"
           # Immutable per-commit pin plus a floating tag the deploy can track.
           echo "tags=${IMAGE}:sha-${SHORT_SHA},${IMAGE}:deploy-latest" >> "$GITHUB_OUTPUT"
