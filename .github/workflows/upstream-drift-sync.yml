@@ -41,6 +41,10 @@ env:
   SYNC_BRANCH: ${{ github.event.inputs.sync_branch != '' && github.event.inputs.sync_branch || 'auto/upstream-sync' }}
   UPSTREAM_URL: https://github.com/omnigent-ai/omnigent.git
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # This repo is a fork; without GH_REPO, `gh pr create` defaults --base to the
+  # PARENT (omnigent-ai/omnigent), which GITHUB_TOKEN can't write — pin gh to the
+  # fork so the sync PR is raised here.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   drift:
