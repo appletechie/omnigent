@@ -1,0 +1,139 @@
+# Fork-only: keep deploy/acp-slug-branding synced with upstream/main WITHOUT a
+# headless merge. Daily, it trial-merges upstream into a standing sync branch:
+#   - clean merge  -> push the branch + open/update a PR (deploy <- sync). A human
+#     reviews the real diff and merges; that push fires deploy-image.yml, which
+#     builds + publishes the image. The PR merge IS the approval.
+#   - conflicts    -> open/refresh a "manual merge needed" issue listing the
+#     conflicted files, and touch nothing. Conflict resolution needs a human in
+#     the merge, not an approval after the fact.
+# Never merges to deploy on its own. Additive, fork-only — upstream merges won't
+# touch it. Runs on GITHUB_TOKEN (same-repo branch/PR/issue ops; NOT a package
+# push, so the fork limitation that forced GHCR_PAT does not apply here).
+name: Upstream drift sync
+
+on:
+  schedule:
+    - cron: "0 5 * * *" # daily 05:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-drift-sync
+  cancel-in-progress: false
+
+env:
+  DEPLOY_BRANCH: deploy/acp-slug-branding
+  SYNC_BRANCH: auto/upstream-sync
+  UPSTREAM_URL: https://github.com/omnigent-ai/omnigent.git
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout deploy branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: deploy/acp-slug-branding
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "omnigent-drift-bot"
+          git config user.email "noreply@omnigent.local"
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream main --quiet
+
+      - name: Measure drift
+        id: drift
+        run: |
+          set -euo pipefail
+          BEHIND="$(git rev-list --count "origin/${DEPLOY_BRANCH}..upstream/main")"
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "Deploy is ${BEHIND} commit(s) behind upstream/main."
+
+      - name: Trial-merge upstream into sync branch
+        id: merge
+        if: steps.drift.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          git checkout -B "$SYNC_BRANCH" "origin/${DEPLOY_BRANCH}"
+          if git merge --no-edit --no-ff upstream/main; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            CONFLICTS="$(git diff --name-only --diff-filter=U | sed 's/^/- /')"
+            git merge --abort || true
+            {
+              echo "result=conflict"
+              echo "conflicts<<EOF"
+              echo "${CONFLICTS}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push sync branch (clean merge)
+        if: steps.merge.outputs.result == 'clean'
+        run: git push --force-with-lease origin "HEAD:${SYNC_BRANCH}"
+
+      - name: Open or update sync PR (clean merge)
+        if: steps.merge.outputs.result == 'clean'
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind }}
+        run: |
+          set -euo pipefail
+          SHORT="$(git rev-parse --short upstream/main)"
+          TITLE="chore(sync): merge upstream/main (${BEHIND} commit(s), @${SHORT})"
+          BODY="$(cat <<EOF
+          Automated upstream sync. Trial-merged \`upstream/main\` (@${SHORT}) into \`${DEPLOY_BRANCH}\` — **merged clean, no conflicts**.
+
+          - Behind by **${BEHIND}** commit(s) at run time.
+          - Review the diff below. **Merging this PR triggers \`deploy-image.yml\`** which builds + publishes the image; then cut over with \`docker compose pull && up -d\` on dokploy-root and (if host code changed) let the runtime-sync timers pick it up.
+          - Verify the fork fixes survived and tests are green before merging — a clean text-merge can still hide a semantic break.
+
+          _Opened by the upstream-drift-sync workflow. Force-updated on each run while drift persists._
+          EOF
+          )"
+          if gh pr view "$SYNC_BRANCH" --json number >/dev/null 2>&1; then
+            gh pr edit "$SYNC_BRANCH" --title "$TITLE" --body "$BODY"
+            echo "Updated existing sync PR."
+          else
+            gh pr create --base "$DEPLOY_BRANCH" --head "$SYNC_BRANCH" --title "$TITLE" --body "$BODY"
+            echo "Opened new sync PR."
+          fi
+
+      - name: Open or refresh conflict issue
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          set -euo pipefail
+          SHORT="$(git rev-parse --short upstream/main)"
+          TITLE="Manual merge needed: upstream/main conflicts with deploy"
+          BODY="$(cat <<EOF
+          The daily upstream sync could **not** merge \`upstream/main\` (@${SHORT}) into \`${DEPLOY_BRANCH}\` cleanly — deploy is ${BEHIND} commit(s) behind and these files conflict:
+
+          ${CONFLICTS}
+
+          Resolve by hand (worktree off \`${DEPLOY_BRANCH}\`, \`git merge upstream/main\`, port the fork hunks), then push. Conflict resolution needs a human in the merge, so no PR was opened.
+
+          _Refreshed by the upstream-drift-sync workflow while the conflict persists._
+          EOF
+          )"
+          EXISTING="$(gh issue list --search "in:title Manual merge needed: upstream/main conflicts with deploy" --state open --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "${EXISTING:-}" ]; then
+            gh issue edit "$EXISTING" --body "$BODY"
+            echo "Refreshed conflict issue #${EXISTING}."
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+            echo "Opened conflict issue."
+          fi

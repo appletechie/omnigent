@@ -15,6 +15,9 @@ name: Publish deploy image
 on:
   push:
     branches: [deploy/acp-slug-branding]
+    # Workflow/CI-only changes don't affect the image — skip the rebuild.
+    paths-ignore:
+      - ".github/**"
   workflow_dispatch: {}
 
 # One publish per ref at a time; a newer push supersedes an in-flight build.
