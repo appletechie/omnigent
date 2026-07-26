@@ -14,7 +14,18 @@ name: Upstream drift sync
 on:
   schedule:
     - cron: "0 5 * * *" # daily 05:00 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
+    # Optional overrides let a throwaway branch exercise the merge->PR path
+    # without touching the real deploy branch. Empty on schedule -> defaults.
+    inputs:
+      base_branch:
+        description: Base branch to sync into (default deploy/acp-slug-branding)
+        required: false
+        default: ""
+      sync_branch:
+        description: Sync branch to push (default auto/upstream-sync)
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -26,8 +37,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DEPLOY_BRANCH: deploy/acp-slug-branding
-  SYNC_BRANCH: auto/upstream-sync
+  DEPLOY_BRANCH: ${{ github.event.inputs.base_branch != '' && github.event.inputs.base_branch || 'deploy/acp-slug-branding' }}
+  SYNC_BRANCH: ${{ github.event.inputs.sync_branch != '' && github.event.inputs.sync_branch || 'auto/upstream-sync' }}
   UPSTREAM_URL: https://github.com/omnigent-ai/omnigent.git
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -35,10 +46,10 @@ jobs:
   drift:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout deploy branch
+      - name: Checkout base branch
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: deploy/acp-slug-branding
+          ref: ${{ env.DEPLOY_BRANCH }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
