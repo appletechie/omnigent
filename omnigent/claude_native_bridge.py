@@ -2611,6 +2611,11 @@ def inject_user_message(
     # Ctrl-U only clears backwards from cursor.
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+    # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
+    # Claude Code TUI treats them as user text instead of invoking a state
+    # that Omnigent cannot drive. Allowed commands (``/clear``,
+    # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
+    injected_text = _escape_unsupported_slash_command(content)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -2622,7 +2627,7 @@ def inject_user_message(
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(content + "\n"))
+        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
         paste_path = paste_file.name
     try:
         _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
@@ -4474,6 +4479,67 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
         "ultrareview",
     }
 )
+
+# Slash commands that Omnigent lets a user type directly into the native
+# Claude Code terminal. Anything not in this set or not a skill is sent
+# as plain text so Claude Code's TUI does not enter an unsupported state
+# (menu, login prompt, exit, etc.) that Omnigent cannot drive.
+_CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS: frozenset[str] = (
+    _CLAUDE_CLI_SURFACED_COMMANDS | frozenset({"branch", "fork"})
+)
+
+
+def _first_slash_command_name(content: str) -> str | None:
+    """
+    Return the name of a leading ``/<name>`` slash command, if any.
+
+    Leading whitespace is ignored; the command ends at the first
+    whitespace character. Returns ``None`` when the content does not
+    begin with a slash command.
+    """
+    stripped = content.lstrip()
+    if not stripped.startswith("/"):
+        return None
+    remainder = stripped[1:]
+    match = re.match(r"(\S+)", remainder)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _escape_slash_command_text(content: str) -> str:
+    """
+    Return *content* escaped so it is treated as plain user text.
+
+    Inserts a zero-width no-break space (U+FEFF) immediately before the
+    leading slash. Claude Code sees a non-slash first character, so the
+    input is submitted as a regular message, while the user still sees
+    their original slash.
+    """
+    match = re.match(r"^(\s*)(/)(.*)$", content, re.DOTALL)
+    if not match:
+        return content
+    return f"{match.group(1)}\ufeff{match.group(2)}{match.group(3)}"
+
+
+def _escape_unsupported_slash_command(content: str) -> str:
+    """
+    Escape built-in UI slash commands that Omnigent cannot drive.
+
+    If the message starts with a known dropped Claude Code command
+    (e.g. ``/help``, ``/exit``), escapes it so Claude treats it as
+    regular text. Allowed commands (``/clear``, ``/model``, ``/fork``,
+    skills, etc.) pass through unchanged.
+    """
+    name = _first_slash_command_name(content)
+    if name is None:
+        return content
+    if name in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS:
+        return content
+    if name not in _CLAUDE_CLI_DROPPED_COMMANDS:
+        # Unknown name: likely a skill; let Claude Code handle it.
+        return content
+    return _escape_slash_command_text(content)
 
 
 @dataclass(frozen=True)

@@ -78,7 +78,10 @@ vi.mock("@/hooks/useConversations", () => ({
     const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
     const idSet = new Set(ids);
     return {
-      data: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+      data: {
+        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+        filterHonored: true,
+      },
       isSuccess: true,
     };
   },
@@ -111,6 +114,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));

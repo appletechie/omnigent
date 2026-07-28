@@ -12,7 +12,7 @@ import shlex
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -41,6 +41,7 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
     _find_codex_cli,
+    _merge_codex_hook_trust_back,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
@@ -822,6 +823,14 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
+        # Flush any hook-trust the user accepted this session back into the
+        # global config so the next session's copy inherits it and
+        # _retarget_codex_hook_trust_keys can carry it forward without prompting.
+        _merge_codex_hook_trust_back(
+            self.codex_home / "config.toml",
+            _codex_home_config_source_from_env(),
+            self.codex_home,
+        )
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -1262,11 +1271,16 @@ class NativeCodexLaunch:
     :param profile: Databricks profile for the ucode path, or ``None`` (a
         generic provider routes via *config_overrides*; CLI login uses
         neither).
+    :param summary: Human-readable one-line description of the routing
+        outcome (provider / profile / model, or the login-fallback state),
+        set at resolution time and surfaced in the startup-timeout error so
+        hosted users can diagnose without runner-log access (see #2745).
     """
 
     config_overrides: list[str]
     model: str | None
     profile: str | None
+    summary: str = ""
 
 
 def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
@@ -1345,7 +1359,12 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     )
 
     if entry.kind == DATABRICKS_KIND:
-        return NativeCodexLaunch(config_overrides=[], model=model, profile=entry.profile)
+        return NativeCodexLaunch(
+            config_overrides=[],
+            model=model,
+            profile=entry.profile,
+            summary=f"Databricks ucode profile {entry.profile!r}",
+        )
     if entry.kind == CLI_CONFIG_KIND:
         # Pin the config.toml-defined provider by name; its table (and
         # credential) ride along via the bridged config.toml. json.dumps
@@ -1354,6 +1373,9 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
             config_overrides=[f"model_provider={json.dumps(entry.model_provider)}"],
             model=model,
             profile=None,
+            summary=(
+                f"provider {entry.name!r} via cli-config (model_provider={entry.model_provider!r})"
+            ),
         )
     if entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         return None
@@ -1380,7 +1402,12 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         auth_command=auth_command,
         wire_api=family.wire_api or "responses",
     )
-    return NativeCodexLaunch(config_overrides=overrides, model=pinned, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=overrides,
+        model=pinned,
+        profile=None,
+        summary=f"provider {entry.name!r} (model={pinned})",
+    )
 
 
 def _first_routable_codex_provider(
@@ -1476,7 +1503,10 @@ def _resolve_subscription_launch(
             entry.name,
         )
         return NativeCodexLaunch(
-            config_overrides=subscription_overrides, model=model, profile=None
+            config_overrides=subscription_overrides,
+            model=model,
+            profile=None,
+            summary=f"Codex CLI login (subscription provider {entry.name!r}; Codex is logged in)",
         )
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
@@ -1486,7 +1516,16 @@ def _resolve_subscription_launch(
         "Codex login and no alternative provider is configured)",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=subscription_overrides, model=model, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=subscription_overrides,
+        model=model,
+        profile=None,
+        summary=(
+            f"Codex CLI login (subscription provider {entry.name!r} has no usable Codex "
+            "login and no alternative provider is configured) — the TUI likely renders "
+            "the sign-in screen and never starts a thread"
+        ),
+    )
 
 
 def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
@@ -1545,9 +1584,19 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         # (parity with _resolve_provider_for_build).
         global_auth = _load_global_auth()
         if isinstance(global_auth, DatabricksAuth):
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=global_auth.profile)
+            return NativeCodexLaunch(
+                config_overrides=[],
+                model=model,
+                profile=global_auth.profile,
+                summary=f"Databricks ucode profile {global_auth.profile!r} (global auth block)",
+            )
         if global_auth is not None:
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=None)
+            return NativeCodexLaunch(
+                config_overrides=[],
+                model=model,
+                profile=None,
+                summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
+            )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
     if entry is None:
@@ -1556,7 +1605,17 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
             "through a provider."
         )
-        return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+        return NativeCodexLaunch(
+            config_overrides=no_provider_overrides,
+            model=model,
+            profile=None,
+            summary=(
+                "Codex CLI login (no provider configured for the codex harness, no "
+                "Databricks profile) — the TUI likely renders the ChatGPT sign-in "
+                "screen and never starts a thread; run `omnigent setup` to route through "
+                "a provider"
+            ),
+        )
     if entry.kind == SUBSCRIPTION_KIND:
         return _resolve_subscription_launch(entry, model, explicit)
 
@@ -1574,7 +1633,16 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         "credential — falling back to Codex's own login.",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=no_provider_overrides,
+        model=model,
+        profile=None,
+        summary=(
+            f"Codex CLI login (provider {entry.name!r} is the codex default but has no "
+            "usable openai credential) — the TUI likely renders the sign-in screen "
+            "and never starts a thread"
+        ),
+    )
 
 
 def client_for_transport(
@@ -1608,7 +1676,98 @@ def client_for_transport(
     return CodexAppServerClient(Path(transport), client_name=client_name)
 
 
-async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> None:
+def normalize_codex_permission_launch_args(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Complete legacy Full Access args with their approval policy."""
+    args = list(terminal_launch_args or ())
+    full_access = False
+    has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
+            has_approval_policy = True
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            assignment = args[index]
+        elif arg.startswith(("--config=", "-c=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, _, raw_value = assignment.partition("=")
+            if key.strip() == "approval_policy":
+                has_approval_policy = True
+            elif key.strip() == "default_permissions":
+                full_access = _codex_config_string(raw_value) == ":danger-full-access"
+        index += 1
+    if full_access and not has_approval_policy:
+        args.extend(["-c", 'approval_policy="never"'])
+    return args
+
+
+def _codex_config_string(raw_value: str) -> str:
+    try:
+        value = tomlkit.parse(f"value = {raw_value}")["value"]
+    except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
+        value = raw_value.strip().strip('"').strip("'")
+    return value if isinstance(value, str) else ""
+
+
+def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
+    """Convert persisted Codex permission args into thread-resume overrides."""
+    params: CodexParams = {}
+    args = normalize_codex_permission_launch_args(terminal_launch_args)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        value: str | None = None
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            params.update(approvalPolicy="never", sandbox="danger-full-access")
+        elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
+            if index + 1 < len(args):
+                value = args[index + 1]
+                index += 1
+            if value is not None:
+                field = "approvalPolicy" if arg in {"--ask-for-approval", "-a"} else "sandbox"
+                params[field] = value
+        elif arg.startswith(("--ask-for-approval=", "-a=")):
+            params["approvalPolicy"] = arg.split("=", 1)[1]
+        elif arg.startswith(("--sandbox=", "-s=")):
+            params["sandbox"] = arg.split("=", 1)[1]
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            key, _, value = args[index].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        elif arg.startswith(("--config=", "-c=")):
+            key, _, value = arg.split("=", 1)[1].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        index += 1
+    if "permissions" in params:
+        params.pop("sandbox", None)
+    return params
+
+
+def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> None:
+    field = {
+        "approval_policy": "approvalPolicy",
+        "approvals_reviewer": "approvalsReviewer",
+        "default_permissions": "permissions",
+        "sandbox_mode": "sandbox",
+    }.get(key.strip())
+    if field is None:
+        return
+    value = _codex_config_string(raw_value)
+    if value:
+        params[field] = value
+
+
+async def preload_codex_thread_for_resume(
+    transport: str,
+    thread_id: str,
+    *,
+    terminal_launch_args: Sequence[str] | None = None,
+) -> None:
     """
     Load an existing Codex thread into a freshly started app-server.
 
@@ -1622,6 +1781,7 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
         or ``"/tmp/app-server.sock"``.
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
+    :param terminal_launch_args: Persisted permission overrides for the resumed thread.
     :returns: None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -1633,7 +1793,11 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
     try:
         await client.request(
             "thread/resume",
-            {"threadId": thread_id, "excludeTurns": True},
+            {
+                "threadId": thread_id,
+                "excludeTurns": True,
+                **_codex_resume_permission_params(terminal_launch_args),
+            },
         )
     finally:
         await client.close()
@@ -1800,7 +1964,7 @@ def build_codex_remote_args(
         # bypass flag (a global flag, so it precedes any ``resume``).
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
-        passthrough = list(codex_args)
+        passthrough = normalize_codex_permission_launch_args(codex_args)
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
