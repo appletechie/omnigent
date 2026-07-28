@@ -177,6 +177,41 @@ def test_cursor_native_permission_mode_auto_uses_auto_review() -> None:
     assert _derive_terminal_launch_args_from_spec(spec) == ["--auto-review"]
 
 
+def test_antigravity_native_bypass_translates_to_skip_permissions() -> None:
+    """
+    antigravity-native + ``bypassPermissions`` -> ``--dangerously-skip-permissions``.
+
+    Without the flag a server-spawned agy worker stalls on the
+    request-review prompt, which no orchestrator can answer. A failure here
+    means the declared bypass never reached the runner argv.
+    """
+    spec = _spec_with_config(
+        {"harness": "antigravity-native", "permission_mode": "bypassPermissions"}
+    )
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--dangerously-skip-permissions"]
+
+
+def test_kimi_native_bypass_translates_to_yolo_flag() -> None:
+    """kimi-native + ``bypassPermissions`` -> ``--yolo`` (auto-approve tools)."""
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": "bypassPermissions"})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--yolo"]
+
+
+@pytest.mark.parametrize("harness", ["antigravity-native", "kimi-native"])
+def test_agy_and_kimi_without_bypass_keep_prompting(harness: str) -> None:
+    """
+    Neither harness bypasses unless the bundle asks for it verbatim.
+
+    These two translate an explicit ``bypassPermissions`` only — unlike
+    codex-native/cursor-native, which bypass by default. A failure here
+    means a bundle that never declared a mode (or declared a milder one)
+    silently got full bypass.
+    """
+    assert _derive_terminal_launch_args_from_spec(_spec_with_config({"harness": harness})) is None
+    spec = _spec_with_config({"harness": harness, "permission_mode": "acceptEdits"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
 @pytest.mark.parametrize(
     "harness",
     ["claude-sdk", "codex", "openai-agents", "cursor"],
