@@ -4868,6 +4868,7 @@ def _build_model_readout_lines(
     )
     from omnigent.onboarding.provider_config import (
         PI_SURFACE,
+        _harness_owns_its_credential,
         describe_active_credential,
         harness_family,
         load_providers,
@@ -4875,6 +4876,14 @@ def _build_model_readout_lines(
     )
 
     lines: list[str] = []
+    if harness and _harness_owns_its_credential(harness):
+        # The external agent authenticates itself and chooses its own model,
+        # so there is no Omnigent credential to name and an Omnigent-side
+        # /model override does not reach it.
+        return [
+            "Active:  the agent's own model  ·  🤖 ACP agent (owns its model + auth)",
+            "  set the model in the agent's own config or launch command.",
+        ]
     cred = describe_active_credential(config, harness, model_override=model_override)
     if cred is None:
         # Nothing resolves for this harness's surface — not in the explicit

@@ -1288,6 +1288,29 @@ def _source_descriptor(family: FamilyConfig) -> str:
     )
 
 
+def _harness_owns_its_credential(harness: str) -> bool:
+    """Whether *harness* carries its own auth, so Omnigent resolves none.
+
+    True for ACP-backed harnesses (``acp``/``acp:<slug>``, goose, qwen and
+    any community ACP plugin): the external agent authenticates itself and
+    picks its own model, so describing an Omnigent provider for one would
+    name a credential the session never uses.
+
+    :param harness: The harness name, canonical or ``acp:<slug>``.
+    :returns: ``True`` when the harness owns its own credential.
+    """
+    from omnigent.harness_capabilities import AuthModel, IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
+
+    key = harness.split(":", 1)[0] if harness.startswith("acp:") else harness
+    caps = harness_capabilities().get(canonicalize_harness(key))
+    if caps is None:
+        return False
+    return (
+        caps.integration_mode is IntegrationMode.ACP_SUBPROCESS and caps.auth is AuthModel.OWN_AUTH
+    )
+
+
 def describe_active_credential(
     config: dict[str, object],
     harness: str,
@@ -1313,6 +1336,9 @@ def describe_active_credential(
     :raises OmnigentError: If the resolved provider is malformed, or more
         than one default serves the family.
     """
+    if _harness_owns_its_credential(harness):
+        return None
+
     provider = default_provider_for_harness(config, harness)
     if provider is None:
         return None
