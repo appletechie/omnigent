@@ -549,6 +549,35 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
         self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
 
+    def test_responses_provider_keeps_codex_gateway_on_databricks(self):
+        # Databricks: the Responses provider must stay on the workspace's
+        # ``/ai-gateway/codex/v1`` path, both for a ucode-supplied codex base
+        # URL and for the legacy profile-only path with no base URLs at all.
+        for base_urls in (None, {"openai": "https://host.example.com/ai-gateway/codex/v1"}):
+            result = _build_models_json("https://host.example.com", "tok", base_urls)
+            self.assertEqual(
+                result["providers"]["databricks-openai"]["baseUrl"],
+                "https://host.example.com/ai-gateway/codex/v1",
+                base_urls,
+            )
+
+    def test_responses_provider_uses_generic_gateway_base_url(self):
+        # A plain OpenAI-compatible gateway has no ``/ai-gateway/codex`` path —
+        # synthesizing one 404s every newer-GPT dispatch. Use the configured
+        # base URL verbatim so ``/responses`` resolves off it.
+        result = _build_models_json(
+            "https://openai.example.com",
+            "tok",
+            {"openai": "https://openai.example.com/v1"},
+            model="gpt-5.5",
+        )
+        provider = result["providers"]["databricks-openai"]
+        self.assertEqual(provider["baseUrl"], "https://openai.example.com/v1")
+        # gpt-5.5 routes to the Responses provider, so the registered run model
+        # must land on that same (now correct) base URL.
+        self.assertEqual(_pi_provider_for_model("gpt-5.5"), "databricks-openai")
+        self.assertIn("gpt-5.5", [entry.get("id") for entry in provider["models"]])
+
     def test_api_key_set(self):
         result = _build_models_json("https://host.example.com", "mytoken")
         for prov in result["providers"].values():

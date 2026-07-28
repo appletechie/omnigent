@@ -740,15 +740,20 @@ def _build_models_json(
     serving_endpoints_url = f"{h}/serving-endpoints"
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
-    # ucode's ``openai`` gateway is the Codex Responses gateway
-    # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
-    # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
-    # generic providers (no ``/ai-gateway/codex``) pass through. Gemini rides
-    # this path via databricks-completions since pi can't speak generateContent.
-    if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
-        openai_base_url = serving_endpoints_url
-    else:
-        openai_base_url = raw_openai_base_url or serving_endpoints_url
+    # A Databricks/ucode ``openai`` gateway is the Codex Responses gateway
+    # (``.../ai-gateway/codex/v1``); an unset URL means the legacy profile-only
+    # path where *host* is the Databricks workspace. Anything else is a plain
+    # OpenAI-compatible gateway (OpenRouter, LiteLLM, CLIProxyAPI).
+    is_codex_gateway = not raw_openai_base_url or "/ai-gateway/codex" in raw_openai_base_url
+    # The codex gateway 404s pi's openai-completions ``/chat/completions`` POST,
+    # so the completions providers re-route to serving-endpoints; a generic
+    # gateway passes through. Gemini rides this path via databricks-completions
+    # since pi can't speak generateContent.
+    openai_base_url = serving_endpoints_url if is_codex_gateway else raw_openai_base_url
+    # Mirror image for the Responses provider: only a Databricks gateway serves
+    # ``/ai-gateway/codex/v1``. A generic gateway serves ``/responses`` off its
+    # own configured base URL, and 404s the synthesized codex path.
+    responses_base_url = codex_gateway_url if is_codex_gateway else raw_openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
     _openai_responses_compat: dict[str, Any] = {  # type: ignore[explicit-any]
         "supportsDeveloperRole": False,
@@ -759,11 +764,12 @@ def _build_models_json(
     config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
         "providers": {
             # Newer GPT models (gpt-5-5, gpt-5-6-*, gpt-5-3-codex) → OpenAI
-            # Responses API at the AI Gateway. These models reject function
+            # Responses API (the AI Gateway's codex path on Databricks, the
+            # provider's own base URL elsewhere). These models reject function
             # tools via /chat/completions but work via /responses. The Responses
             # API now supports tool-result chaining on subsequent turns.
             "databricks-openai": {
-                "baseUrl": codex_gateway_url,
+                "baseUrl": responses_base_url,
                 "apiKey": token,
                 "api": "openai-responses",
                 "authHeader": True,
