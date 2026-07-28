@@ -1,0 +1,530 @@
+# Instincts generated from https://github.com/appletechie/omnigent
+# Generated: 2026-07-28T16:36:55.403Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: omnigent-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Commit Length
+
+## Action
+
+Keep commit messages concise (~49 characters)
+
+## Evidence
+
+- Average commit message length: 49 chars
+- Based on 1 commits
+
+---
+id: omnigent-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: omnigent-import-alias
+trigger: "when importing modules"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Import Alias
+
+## Action
+
+Use path aliases (@/, ~/) instead of relative imports
+
+## Evidence
+
+- Import analysis shows alias pattern
+- Example: import { x } from '@/lib/x'
+
+---
+id: omnigent-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: omnigent-arch-type-based
+trigger: "when adding new code"
+confidence: 0.8
+domain: architecture
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Arch Type Based
+
+## Action
+
+Place code in the appropriate type folder (components/, services/, utils/, etc.)
+
+## Evidence
+
+- Type-based module organization detected
+- Folders: 
+
+---
+id: omnigent-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: omnigent-test-framework
+trigger: "when writing tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Test Framework
+
+## Action
+
+Use vitest as the test framework
+
+## Evidence
+
+- Test framework detected: vitest
+- File pattern: *.test.tsx
+
+---
+id: omnigent-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.tsx
+
+## Evidence
+
+- File pattern: *.test.tsx
+- Consistent across test files
+
+---
+id: omnigent-test-mocking
+trigger: "when mocking dependencies in tests"
+confidence: 0.75
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Test Mocking
+
+## Action
+
+Use vi.mock for mocking
+
+## Evidence
+
+- Mocking pattern detected: vi.mock
+- Consistent across test files
+
+---
+id: omnigent-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/appletechie/omnigent
+---
+
+# Omnigent Test Types
+
+## Action
+
+Write unit, integration, e2e tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, integration, e2e
+- Coverage config: no
+
+---
+id: omnigent-instinct-file-naming
+trigger: "When creating a new file in the repository"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct File Naming
+
+## Action
+
+Name the file using snake_case convention
+
+## Evidence
+
+- Pattern in namingConventions.files: snake_case
+
+---
+id: omnigent-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Function Naming
+
+## Action
+
+Use camelCase for the function name
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: omnigent-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Class Naming
+
+## Action
+
+Use PascalCase for the class name
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: omnigent-instinct-constant-naming
+trigger: "When declaring a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for the constant name
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: omnigent-instinct-import-alias
+trigger: "When importing modules"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Import Alias
+
+## Action
+
+Use alias style for imports
+
+## Evidence
+
+- Pattern in importStyle: alias
+
+---
+id: omnigent-instinct-named-exports
+trigger: "When exporting modules or functions"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Named Exports
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: omnigent-instinct-vitest-pattern
+trigger: "When writing a new test file"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Vitest Pattern
+
+## Action
+
+Name the file with the pattern *.test.tsx
+
+## Evidence
+
+- Pattern in testing.filePattern: *.test.tsx
+
+---
+id: omnigent-instinct-vitest-framework
+trigger: "When writing tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Vitest Framework
+
+## Action
+
+Use the vitest testing framework
+
+## Evidence
+
+- Pattern in testing.framework: vitest
+
+---
+id: omnigent-instinct-vi-mock
+trigger: "When mocking dependencies in tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Vi Mock
+
+## Action
+
+Use vi.mock for mocking
+
+## Evidence
+
+- Pattern in testing.mockingStyle: vi.mock
+
+---
+id: omnigent-instinct-test-types
+trigger: "When categorizing tests"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Test Types
+
+## Action
+
+Classify tests as unit, integration, or e2e
+
+## Evidence
+
+- Pattern in testing.testTypes: unit, integration, e2e
+
+---
+id: omnigent-instinct-no-coverage-config
+trigger: "When configuring test coverage"
+confidence: 0.6
+domain: testing
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct No Coverage Config
+
+## Action
+
+Do not add coverage configuration (coverageConfig: false)
+
+## Evidence
+
+- Pattern in testing.coverageConfig: false
+
+---
+id: omnigent-instinct-try-catch-errors
+trigger: "When handling errors in code"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Try Catch Errors
+
+## Action
+
+Use try-catch blocks for error handling
+
+## Evidence
+
+- Pattern in errorHandling.style: try-catch
+
+---
+id: omnigent-instinct-no-custom-errors
+trigger: "When considering custom error classes"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct No Custom Errors
+
+## Action
+
+Do not create custom error classes
+
+## Evidence
+
+- Pattern in errorHandling.customErrorClasses: false
+
+---
+id: omnigent-instinct-no-error-boundaries
+trigger: "When considering error boundaries"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct No Error Boundaries
+
+## Action
+
+Do not implement error boundaries
+
+## Evidence
+
+- Pattern in errorHandling.errorBoundaries: false
+
+---
+id: omnigent-instinct-no-global-error-handler
+trigger: "When considering a global error handler"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct No Global Error Handler
+
+## Action
+
+Do not implement a global error handler
+
+## Evidence
+
+- Pattern in errorHandling.globalHandler: false
+
+---
+id: omnigent-instinct-commit-freeform
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Commit Freeform
+
+## Action
+
+Use freeform commit messages without a specific prefix
+
+## Evidence
+
+- Pattern in commits.type: freeform
+- Example: 'Merge upstream/main into deploy/acp-slug-branding'
+
+---
+id: omnigent-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: appletechie/omnigent
+---
+
+# Omnigent Instinct Commit Length
+
+## Action
+
+Keep the commit message concise (average length ~49 characters)
+
+## Evidence
+
+- Pattern in commits.averageLength: 49
+
