@@ -8,7 +8,6 @@ from omnigent.harness_plugins import (
     harness_capabilities,
     harness_labels,
     harness_modules,
-    model_env_keys,
     valid_harnesses,
 )
 from omnigent.inner.acp_executor import AcpExecutor
@@ -21,7 +20,6 @@ def test_grok_registered_as_builtin_harness() -> None:
     assert harness_modules()["grok"] == "omnigent.inner.grok_harness"
     assert canonicalize_harness("grok-build") == "grok"
     assert harness_labels().get("grok") == "Grok Build"
-    assert model_env_keys().get("grok") == "HARNESS_GROK_MODEL"
     assert "grok" in harness_capabilities()
 
 

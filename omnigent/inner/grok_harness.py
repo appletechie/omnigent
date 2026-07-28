@@ -12,8 +12,8 @@ agent uses, but promoted to a builtin harness with lifecycle detection, an
 ``omnigent grok`` wrapper, and setup-menu awareness (see the ``qwen`` pattern).
 
 Auth is Grok's own (``grok login`` xAI OAuth or ``XAI_API_KEY``); Omnigent stores
-no credential. A per-session ``/model`` pick rides through the executor's
-``session/set_model`` (see ``AcpExecutor.run_turn``).
+no credential. Model selection is likewise the CLI's own (``/model`` inside
+Grok) — this harness declares no Omnigent-driven model override.
 
 Env vars read at startup:
 

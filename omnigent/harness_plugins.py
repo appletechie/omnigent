@@ -641,7 +641,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
-        "grok": "HARNESS_GROK_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",
