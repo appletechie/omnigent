@@ -382,7 +382,12 @@ class HostRegistry:
             self._hosts[key] = conn
         return conn
 
-    def deregister(self, host_id: str, workspace_id: int | None = None) -> None:
+    def deregister(
+        self,
+        host_id: str,
+        workspace_id: int | None = None,
+        conn: HostConnection | None = None,
+    ) -> HostConnection | None:
         """Remove a host connection.
 
         No-op if ``(workspace_id, host_id)`` is not registered.
@@ -391,10 +396,20 @@ class HostRegistry:
             spelling (see :func:`_canonical_host_id`).
         :param workspace_id: Tenant partition; defaults to
             :func:`current_workspace_id`.
+        :param conn: Optional generation guard. When provided, the entry
+            is removed only if it is this exact connection object, so a
+            reconnecting host's teardown can't evict the newer tunnel
+            that already replaced it (see :meth:`register`).
+        :returns: The removed connection, or ``None`` when the host was
+            already offline or the guard did not match.
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
+        key = (ws_id, _canonical_host_id(host_id))
         with self._lock:
-            self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
+            current = self._hosts.get(key)
+            if current is None or (conn is not None and current is not conn):
+                return None
+            return self._hosts.pop(key)
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.
