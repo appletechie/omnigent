@@ -177,6 +177,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``HARNESS_GOOSE_GATEWAY*`` vars for this matrix to drive. Its live round-trip
     is covered by the dedicated ``test_goose_acp_e2e.py`` suite.
 
+    ``grok`` (headless ACP) is excluded for the same reason as ``goose``: it
+    authenticates from the ``grok`` CLI's own xAI login, not the shared
+    gateway/profile probe wiring this matrix drives, so there are no
+    ``HARNESS_GROK_GATEWAY*`` vars for it to probe with. Its coverage is the
+    dedicated ``tests/inner/test_grok_harness.py`` suite.
+
     ``acp`` (the generic ACP harness) is excluded because it has no fixed binary
     or command of its own — it drives whatever ACP-agent command the user
     registers in the ``acp:`` config block, so there is nothing for this
@@ -241,6 +247,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "qwen-native",
         "goose",
         "goose-native",
+        "grok",
         "kiro-native",
         "kimi",
         "kimi-native",
