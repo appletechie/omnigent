@@ -7782,6 +7782,41 @@ def create_runner_app(
     @app.get("/v1/sessions/{session_id}/codex-model-options")
     async def get_session_codex_model_options(session_id: str) -> JSONResponse:
         harness = _session_harness_name(session_id)
+        # A harness-override session (e.g. Polly overridden to acp:droid) caches
+        # the bundle agent's spec, so _session_harness_name returns that harness
+        # (claude-sdk), not the picked acp one. Key off the RUNNING subprocess too.
+        # ``running_harness`` is an optional introspection hook — not every
+        # process-manager implementation exposes it, so resolve it defensively
+        # rather than 500-ing this endpoint on the ones that don't.
+        _running_harness = getattr(process_manager, "running_harness", None)
+        running = _running_harness(session_id) if _running_harness is not None else None
+        if harness == "acp" or running == "acp":
+            # ACP agents own their model list (session/new SessionModelState);
+            # ask the running harness subprocess. No live harness yet (no turn
+            # run) -> empty, so the picker simply shows nothing until it loads.
+            if process_manager is None:
+                return JSONResponse(status_code=200, content={"models": []})
+            client = process_manager.existing_client(session_id)
+            if client is None:
+                return JSONResponse(status_code=200, content={"models": []})
+            try:
+                resp = await client.get(f"/v1/sessions/{session_id}/model-options")
+                resp.raise_for_status()
+                data = resp.json()
+                # ACP SessionModelState uses ``modelId``/``name``; the picker
+                # wants ``id``/``displayName``.
+                models = [
+                    {"id": mid, "displayName": m.get("name") or mid}
+                    for m in (data.get("models") or [])
+                    if isinstance(m, dict) and (mid := m.get("modelId") or m.get("id"))
+                ]
+                return JSONResponse(
+                    status_code=200,
+                    content={"models": models, "current": data.get("current")},
+                )
+            except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+                _logger.warning("ACP model options failed for %s: %s", session_id, exc)
+                return JSONResponse(status_code=200, content={"models": []})
         if harness not in ("codex-native", "opencode-native"):
             return JSONResponse(status_code=200, content={"models": []})
         if harness == "opencode-native":

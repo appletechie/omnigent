@@ -5703,7 +5703,7 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "acp";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -5783,6 +5783,11 @@ export function modelPickerKindForConv(
       // ``/model`` picks back to ``model_override`` via the extension's
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
+    case "acp-native-ui":
+      // Generic-ACP agents (droid, grok, …) advertise a live model list in
+      // their session/new SessionModelState; a pick rides as model_override
+      // and the ACP executor applies it live via session/set_model.
+      return "acp";
     default:
       return null;
   }
@@ -6370,7 +6375,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
-    modelPickerKind === "opencode";
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "acp";
   const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
@@ -6411,7 +6417,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "opencode" ||
-    modelPickerKind === "pi"
+    modelPickerKind === "pi" ||
+    modelPickerKind === "acp"
       ? sessionModelOverride
       : (sessionModelOverride ?? sessionStickyModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky

@@ -7732,6 +7732,37 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv
+    elif conv.harness_override and (
+        conv.harness_override.startswith("acp:") or conv.harness_override in ("grok", "grok-build")
+    ):
+        # Generic-ACP session (acp:<slug>) or the builtin ``grok`` ACP harness:
+        # tag it so the web model picker and the model-options fetch recognize it
+        # — ACP agents own their model list (SessionModelState) but have no
+        # native-agent registration to carry the wrapper label.
+        #
+        # Ordered BEFORE the REPL-terminal arm below because ACP is a non-native
+        # harness: that arm matches every host-bound top-level ACP session, and
+        # in an elif chain it would short-circuit this one, leaving the picker
+        # untagged for exactly the sessions it exists for. Its label is folded in
+        # here instead (different key), so an ACP session keeps the terminal view.
+        _acp_labels = dict(body.labels) if body.labels else {}
+        _acp_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _ACP_WRAPPER_LABEL_VALUE
+        if body.sub_agent_name is None and body.host_id is not None:
+            _acp_labels.update(
+                _repl_terminal_ui_labels(
+                    agent=agent,
+                    agent_cache=agent_cache,
+                    harness_override=harness_override,
+                )
+            )
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _acp_labels)
+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if updated_conv is None:
+            raise OmnigentError(
+                f"Session {conv.id!r} disappeared while setting the ACP wrapper label",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        conv = updated_conv
     elif (
         body.sub_agent_name is None
         and body.host_id is not None
