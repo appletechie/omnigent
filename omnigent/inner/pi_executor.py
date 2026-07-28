@@ -703,6 +703,19 @@ def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
     return redacted
 
 
+def _gateway_path_segments(base_url: str) -> list[str]:
+    """Return *base_url*'s path split into segments, for whole-segment matching.
+
+    Matching an AI Gateway surface by substring lets a query string carrying
+    the text, or a merely prefixed segment (``/ai-gateway/codex-shim/v1``),
+    misclassify a generic OpenAI-compatible gateway.
+
+    :param base_url: A configured provider base URL.
+    :returns: The URL path's ``/``-separated segments.
+    """
+    return _urlparse(base_url).path.split("/")
+
+
 def _build_models_json(
     host: str,
     token: str,
@@ -745,13 +758,18 @@ def _build_models_json(
     # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
     # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
     # generic providers (no ``/ai-gateway/codex``) pass through.
-    if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
+    _segments = _gateway_path_segments(raw_openai_base_url) if raw_openai_base_url else []
+    is_codex_gateway = any(
+        first == "ai-gateway" and second == "codex"
+        for first, second in zip(_segments, _segments[1:], strict=False)
+    )
+    if is_codex_gateway:
         openai_base_url = serving_endpoints_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
     # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
     # /ai-gateway/* paths don't exist — use the generic base URL for all paths.
-    is_generic_provider = bool(raw_openai_base_url and "/ai-gateway/" not in raw_openai_base_url)
+    is_generic_provider = bool(raw_openai_base_url) and "ai-gateway" not in _segments
     if is_generic_provider:
         codex_gateway_url = openai_base_url
         mlflow_gateway_url = openai_base_url

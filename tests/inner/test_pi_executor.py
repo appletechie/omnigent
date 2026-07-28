@@ -435,6 +435,42 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
 
+    def test_codex_prefixed_segment_is_not_the_codex_gateway(self):
+        # The codex-gateway guard matches whole path segments, not a substring.
+        # ``/ai-gateway/codex-shim/v1`` merely starts with "codex"; treating it
+        # as the Codex Responses gateway would re-route the completions
+        # providers to serving-endpoints and 404 every turn against it.
+        url = "https://ws.example.com/ai-gateway/codex-shim/v1"
+        providers = _build_models_json("https://ws.example.com", "tok", base_urls={"openai": url})[
+            "providers"
+        ]
+        self.assertEqual(providers["databricks"]["baseUrl"], url)
+        self.assertEqual(providers["databricks-completions"]["baseUrl"], url)
+
+    def test_query_string_mentioning_gateway_stays_generic(self):
+        # Only the URL *path* decides. A generic gateway whose query string
+        # happens to carry the text must keep passing through — a substring
+        # test would classify it as a Databricks gateway and rewrite every
+        # provider URL out from under it.
+        url = "https://gateway.example.com/v1?upstream=/ai-gateway/codex/v1"
+        providers = _build_models_json("https://ws.example.com", "tok", base_urls={"openai": url})[
+            "providers"
+        ]
+        self.assertEqual(providers["databricks-openai"]["baseUrl"], url)
+        self.assertEqual(providers["databricks"]["baseUrl"], url)
+
+    def test_real_codex_gateway_still_reroutes_completions(self):
+        # The guard must still fire for the genuine article, or the ucode
+        # Codex Responses gateway 404s pi's /chat/completions POST.
+        url = "https://ws.example.com/ai-gateway/codex/v1"
+        providers = _build_models_json("https://ws.example.com", "tok", base_urls={"openai": url})[
+            "providers"
+        ]
+        self.assertEqual(providers["databricks-openai"]["baseUrl"], url)
+        self.assertEqual(
+            providers["databricks"]["baseUrl"], "https://ws.example.com/serving-endpoints"
+        )
+
     def test_dynamic_model_declared_image_capable(self):
         # #515: a dynamically-registered model must advertise image input, or
         # Pi's transformMessages strips every image block ("model does not
