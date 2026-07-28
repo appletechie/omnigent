@@ -50,7 +50,6 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
-  "grok-build": "Grok Build",
 };
 
 function displayNameForAgent(name: string, harness?: string | null): string {

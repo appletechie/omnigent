@@ -5402,19 +5402,8 @@ async def _attach_to_conversation(
     # Fail loud on a bad session id: _list_all_conversation_items
     # silently falls back to the legacy items endpoint (which returns
     # [] for missing conversations), hiding the 404 until first send.
-    # But don't die on a transient gateway 5xx (e.g. a Cloudflare 502 while
-    # the origin is briefly draining after a deploy): the SSE pump reconnects,
-    # so this one-shot resume must too. A 4xx (bad id) still raises at once.
     if hasattr(session, "session_id"):
-        for attempt in range(4):
-            try:
-                await client.sessions.get(conversation_id)
-                break
-            except OmnigentError as exc:
-                transient = exc.status_code is not None and exc.status_code >= 500
-                if not transient or attempt == 3:
-                    raise
-                await asyncio.sleep(0.5 * (attempt + 1))
+        await client.sessions.get(conversation_id)
 
     # Eagerly bind THIS REPL's runner and start the SSE pump so
     # turns posted from the web UI / another client stream into the

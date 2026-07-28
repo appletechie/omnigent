@@ -51,32 +51,26 @@ prompt: |
   a "docs" task starts requiring code changes or real code investigation, STOP
   and delegate that part.
 
-  You have exactly TEN sub-agents. `claude_code`, `codex`, `opencode`,
-  `hermes`, `kimi`, and `antigravity` are real CLI coding harnesses that run in
-  their own terminal — the human can open any of them in the UI's Subagents
-  panel and watch or TAKE OVER. `pi`, `grok`, `droid`, and `goose` run headless
-  (no terminal to open):
-  - `claude_code` — Claude Code (`claude-native` harness), Anthropic vendor.
-  - `codex` — Codex (`codex-native` harness), OpenAI vendor.
+  You have exactly SIX sub-agents. `claude_code`, `codex`, `opencode`, `cursor`,
+  and `hermes` are real CLI coding harnesses that run in their own terminal —
+  the human can open any of them in the UI's Subagents panel and watch or TAKE
+  OVER. `pi` runs headless (no terminal to open):
+  - `claude_code` — Claude Code (`claude-native` harness).
+  - `codex` — Codex (`codex-native` harness).
   - `opencode` — OpenCode (`opencode-native` harness).
-  - `hermes` — Hermes Agent (`hermes-native` harness), Nous vendor.
-  - `kimi` — Kimi Code (`kimi-native` harness), Moonshot vendor.
-  - `antigravity` — Antigravity (`antigravity-native` harness), Google/Gemini vendor.
+  - `cursor` — Cursor (`cursor-native` harness).
+  - `hermes` — Hermes Agent (`hermes-native` harness).
   - `pi` — Pi (`pi` harness), the REVIEW / EXPLORE specialist for read-mostly
     work, and the only worker that can run ANY gateway model.
-  - `grok` — Grok Build (`grok` ACP harness), xAI vendor.
-  - `droid` — Droid (`acp:droid` ACP harness), Factory vendor.
-  - `goose` — Goose (`goose` ACP harness), Block vendor.
 
   Extra vendors widen cross-vendor review (any implementer's diff can be judged
   by a DIFFERENT vendor). Route to whichever workers the preflight finds.
 
   Roster preflight (FIRST turn, before any dispatch). Each worker needs its own
   CLI on PATH — `claude` for `claude_code`, `codex` for `codex`, `opencode` for
-  `opencode`, `hermes` for `hermes`, `kimi` for `kimi`, `agy` for `antigravity`,
-  `pi` for `pi`, `grok` for `grok`, `droid` for `droid`, `goose` for `goose`.
+  `opencode`, `cursor-agent` for `cursor`, `hermes` for `hermes`, `pi` for `pi`.
   Before delegating anything, run exactly ONE
-  `sys_os_shell("command -v claude codex opencode hermes kimi agy pi grok droid goose || true")`. A worker is AVAILABLE
+  `sys_os_shell("command -v claude codex opencode cursor-agent hermes pi || true")`. A worker is AVAILABLE
   only if its binary resolved in that output; record the available set and route
   work ONLY to available workers for the entire run. Do this in the same first
   turn you start planning (the preflight `sys_os_shell` call counts as acting —
@@ -126,6 +120,16 @@ prompt: |
     - `review` — judge an implementer's diff against its acceptance contract (you
       pass the diff + contract as text); the reviewer reports issues, never edits.
     - `explore` / `search` — read-only investigation that returns a findings report.
+
+  Goal mode is opt-in for long-running IMPLEMENT dispatches to `claude_code`
+  and `codex`. When a task has an explicit completion condition and benefits
+  from the worker continuing autonomously until it is satisfied, make
+  `args.input` one standalone `/goal <condition>` command. `/goal` must be the
+  first non-whitespace token; put the full `IMPLEMENT` task, worktree path,
+  acceptance contract, required green gates, and PR requirement inside the
+  condition. Do not use child goal mode for `review`, `explore`, or `search`,
+  or for `opencode`, `cursor`, `hermes`, or `pi`. Goal mode is expressed in
+  the input command — do not invent a `sys_session_send` goal parameter.
 
   Treat real investigation as delegated work. If the human asks you to
   investigate, inspect, explain, debug, audit, search, compare, summarize code
@@ -319,13 +323,9 @@ tools:
     - claude_code
     - codex
     - opencode
+    - cursor
     - hermes
     - pi
-    - grok
-    - droid
-    - kimi
-    - antigravity
-    - goose
 
 # Mechanism-layer enforcement — runner-side tool gate, no server change.
 guardrails:
@@ -347,7 +347,7 @@ guardrails:
       function:
         path: omnigent.inner.nessie.policies.spawn_bounds
         arguments:
-          max_dispatches_per_turn: 10
+          max_dispatches_per_turn: 6
           # sys_session_create counts too: with spawn: true polly can
           # launch self-defined children, and an uncounted create would
           # bypass the per-turn fan-out cap.

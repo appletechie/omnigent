@@ -11,17 +11,14 @@ tab) or an unrelated tool result to skip.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from omnigent_client._errors import OmnigentError, ServerError
 from prompt_toolkit.document import Document
 
 from omnigent.repl._repl import (
     _SLASH_COMMAND_ALIASES,
     COMMANDS,
     WELCOME_HINTS,
-    _attach_to_conversation,
     _build_call_id_to_name_lookup,
     _build_call_id_to_tool_metadata_lookup,
     _build_model_readout_lines,
@@ -47,54 +44,6 @@ from omnigent.repl._repl import (
     _tmux_session_alive,
 )
 from omnigent.spec.types import SkillSpec
-
-
-async def _run_attach(client: object) -> None:
-    """Drive _attach_to_conversation far enough to exercise the resume retry.
-
-    Both retry-exhaustion and fail-fast paths raise at ``sessions.get`` before
-    the rest of the coroutine runs, so host/fmt/ui_name are never touched.
-    """
-    session = MagicMock()  # has a session_id attr → resume guard fires
-    await _attach_to_conversation(
-        "conv123",
-        session,
-        client,
-        MagicMock(),
-        MagicMock(),
-        ui_name="Grok Build",
-        redraw_screen=False,
-    )
-
-
-@pytest.mark.asyncio
-async def test_attach_retries_transient_5xx_then_raises() -> None:
-    client = MagicMock()
-    client.sessions.get = AsyncMock(
-        side_effect=ServerError("502 Bad Gateway", 502, "server_error")
-    )
-    with (
-        patch("omnigent.repl._repl.asyncio.sleep", new=AsyncMock()) as sleep_mock,
-        pytest.raises(ServerError),
-    ):
-        await _run_attach(client)
-    # 4 attempts total, 3 backoff sleeps between them.
-    assert client.sessions.get.await_count == 4
-    assert sleep_mock.await_count == 3
-
-
-@pytest.mark.asyncio
-async def test_attach_fails_fast_on_4xx() -> None:
-    client = MagicMock()
-    client.sessions.get = AsyncMock(side_effect=OmnigentError("not found", 404, "not_found"))
-    with (
-        patch("omnigent.repl._repl.asyncio.sleep", new=AsyncMock()) as sleep_mock,
-        pytest.raises(OmnigentError),
-    ):
-        await _run_attach(client)
-    # A 4xx (bad session id) still fails loud on the first try — no retry.
-    assert client.sessions.get.await_count == 1
-    assert sleep_mock.await_count == 0
 
 
 def test_parse_sub_agent_handle_returns_raw_handle_dict() -> None:

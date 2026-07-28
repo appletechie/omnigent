@@ -583,57 +583,17 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
-async def _headless_terminal_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
-    """Apply the agent's own declared permission mode to this run's terminal.
-
-    A scheduled task fires with no human present, so a native-terminal harness
-    that stops to ask parks forever and the run times out on terminal readiness.
-    The bundle declares how to handle that (``executor.config.permission_mode``,
-    the recipe the agent-authoring docs give for headless native runs); this
-    reuses the sub-agent path's mapping so the declaration reaches the launch.
-
-    Deliberately does NOT synthesize a mode: forcing one overrides a bundle that
-    chose ``plan``/``acceptEdits`` and silences the user's consent gate, which is
-    kept independent of the policy gate on purpose. A mode the CLI rejects also
-    exits 1 at launch, surfacing as ``required_terminal_exited``.
-
-    Best-effort: any resolution failure returns ``None`` and the run proceeds
-    at the harness default rather than being blocked.
-    """
-    if deps.agent_cache is None:
-        return None
-    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
-    if agent is None or getattr(agent, "bundle_location", None) is None:
-        return None
-    try:
-        loaded = await asyncio.to_thread(deps.agent_cache.load, agent.id, agent.bundle_location)
-        from omnigent.server.routes._sessions.helpers import (
-            _derive_terminal_launch_args_from_spec,
-        )
-
-        return _derive_terminal_launch_args_from_spec(loaded.spec)
-    except Exception:
-        _logger.exception(
-            "scheduled fire: could not derive headless launch args for task %s; "
-            "running at harness default",
-            task.id,
-        )
-        return None
-
-
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     # Connected-host, existing-workspace runs create the conversation directly.
     # Future execution modes such as managed sandbox, branch selection, and
     # replay/backfill must use shared session-create orchestration.
-    launch_args = await _headless_terminal_launch_args(deps, task)
     conv = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
-        terminal_launch_args=launch_args,
     )
     if task.model_override is not None or task.reasoning_effort is not None:
         updated = await asyncio.to_thread(

@@ -1,18 +1,28 @@
 spec_version: 1
-name: goose
-description: Goose (Block) coding sub-agent — implements, cross-vendor reviews, or explores a scoped task headlessly over ACP, on its own model.
+name: cursor
+description: Cursor coding sub-agent — implements, cross-vendor reviews, or explores a scoped task in its own worktree.
 
-# Headless Goose ACP harness (drives ``goose acp``), NOT the goose-native TUI:
-# a dispatched worker needs structured turn events, which the ACP path emits
-# directly — the native TUI mirrors its transcript out-of-band instead, which is
-# far more fragile for an unattended sub-agent. Same ``goose`` binary either way.
+# Native Cursor TUI harness (`cursor-agent`): runs in its own terminal the
+# human can open in the UI's Subagents panel and TAKE OVER. Headless workers
+# can't answer ApprovalCards, so YOLO skips cursor-agent's in-terminal
+# prompts (and the mirrored web cards). Omnigent ``blast_radius`` still
+# DENYs the catastrophic set. Opt out with ``yolo: false``; or set
+# ``permission_mode: auto`` for Smart Auto (``--auto-review``) instead.
 executor:
   type: omnigent
+  # Faster default for Polly Cursor workers; override per-session with ``/model``.
+  # Use the base id from Cursor's model list / SDK (``grok-4.5``). The compound
+  # ``cursor-grok-4.5-high`` also works on cursor-agent, but the SDK catalog
+  # exposes ``grok-4.5``.
+  model: grok-4.5
   config:
-    harness: goose
+    harness: cursor-native
+    # YOLO: headless workers can't answer approval prompts, so run
+    # cursor-agent with full bypass (``--yolo``).
+    yolo: true
 
 prompt: |
-  You are Goose, a coding sub-agent dispatched by the polly
+  You are Cursor, a coding sub-agent dispatched by the polly
   orchestrator for a single scoped task in a dedicated git worktree. Your task
   prompt names its purpose — IMPLEMENT, REVIEW, or EXPLORE. Do exactly that one
   thing; don't refactor or wander unprompted.
@@ -51,10 +61,10 @@ os_env:
   sandbox:
     type: none
 
+# Implementers open their own PRs, so push / gh pr create are allowed
+# (gate_pushes: false). Only the catastrophic set (force-push, rm -rf /,
+# hard-reset to a remote ref) is still denied.
 guardrails:
-  # ACP workers gate on the runner ASK path (like pi) — match its day-long
-  # window instead of auto-denying while the human reads the approval card.
-  ask_timeout: 86400
   policies:
     blast_radius:
       type: function
