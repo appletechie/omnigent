@@ -34,6 +34,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 from urllib.parse import urlparse as _urlparse
+from urllib.parse import urlsplit
 
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
@@ -703,6 +705,27 @@ def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
     return redacted
 
 
+def _is_databricks_codex_gateway(base_url: str | None) -> bool:
+    """Return whether *base_url* names a Databricks AI Gateway codex surface.
+
+    Matches ``ai-gateway`` and ``codex`` as whole, consecutive segments of the
+    URL *path*, so neither a query string carrying that text nor a merely
+    codex-prefixed segment (``/ai-gateway/codex-shim/v1``) misclassifies a
+    generic OpenAI-compatible gateway. An absent URL is the legacy
+    profile-only path, where the Databricks workspace host supplies the URL.
+
+    :param base_url: The configured ``openai`` family base URL, if any.
+    :returns: True for a Databricks codex gateway (or no configured URL).
+    """
+    if not base_url:
+        return True
+    segments = urlsplit(base_url).path.split("/")
+    return any(
+        first == "ai-gateway" and second == "codex"
+        for first, second in itertools.pairwise(segments)
+    )
+
+
 def _build_models_json(
     host: str,
     token: str,
@@ -741,10 +764,9 @@ def _build_models_json(
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     # A Databricks/ucode ``openai`` gateway is the Codex Responses gateway
-    # (``.../ai-gateway/codex/v1``); an unset URL means the legacy profile-only
-    # path where *host* is the Databricks workspace. Anything else is a plain
-    # OpenAI-compatible gateway (OpenRouter, LiteLLM, CLIProxyAPI).
-    is_codex_gateway = not raw_openai_base_url or "/ai-gateway/codex" in raw_openai_base_url
+    # (``.../ai-gateway/codex/v1``); anything else is a plain OpenAI-compatible
+    # gateway (OpenRouter, LiteLLM, CLIProxyAPI).
+    is_codex_gateway = _is_databricks_codex_gateway(raw_openai_base_url)
     # The codex gateway 404s pi's openai-completions ``/chat/completions`` POST,
     # so the completions providers re-route to serving-endpoints; a generic
     # gateway passes through. Gemini rides this path via databricks-completions

@@ -550,14 +550,22 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
 
     def test_responses_provider_keeps_codex_gateway_on_databricks(self):
-        # Databricks: the Responses provider must stay on the workspace's
-        # ``/ai-gateway/codex/v1`` path, both for a ucode-supplied codex base
-        # URL and for the legacy profile-only path with no base URLs at all.
-        for base_urls in (None, {"openai": "https://host.example.com/ai-gateway/codex/v1"}):
-            result = _build_models_json("https://host.example.com", "tok", base_urls)
+        # Databricks: the Responses provider stays on the workspace's
+        # ``/ai-gateway/codex/v1``, SYNTHESIZED from the host argument. The
+        # configured URL deliberately carries a different origin so echoing it
+        # back can't pass. Covers the legacy profile-only path (absent/empty
+        # base URL) and a trailing slash.
+        for base_urls in (
+            None,
+            {"openai": ""},
+            {"openai": "https://gateway.example.net/ai-gateway/codex/v1"},
+            {"openai": "https://gateway.example.net/ai-gateway/codex/"},
+            {"openai": "https://gateway.example.net/ai-gateway/codex"},
+        ):
+            result = _build_models_json("https://workspace.example.com", "tok", base_urls)
             self.assertEqual(
                 result["providers"]["databricks-openai"]["baseUrl"],
-                "https://host.example.com/ai-gateway/codex/v1",
+                "https://workspace.example.com/ai-gateway/codex/v1",
                 base_urls,
             )
 
@@ -569,13 +577,42 @@ class TestBuildModelsJson(unittest.TestCase):
             "https://openai.example.com",
             "tok",
             {"openai": "https://openai.example.com/v1"},
-            model="gpt-5.5",
         )
         provider = result["providers"]["databricks-openai"]
         self.assertEqual(provider["baseUrl"], "https://openai.example.com/v1")
-        # gpt-5.5 routes to the Responses provider, so the registered run model
-        # must land on that same (now correct) base URL.
+
+    def test_codex_gateway_match_is_path_segment_exact(self):
+        # The discriminator reads whole path segments, so a query string
+        # carrying the codex path, a codex-prefixed segment, and an
+        # ``ai-gateway`` segment not followed by ``codex`` all stay generic.
+        for base_url in (
+            "https://proxy.example/v1?upstream=/ai-gateway/codex",
+            "https://proxy.example/v1#/ai-gateway/codex",
+            "https://proxy.example/ai-gateway/codex-shim/v1",
+            "https://proxy.example/my-ai-gateway/codex/v1",
+            "https://proxy.example/ai-gateway/anthropic/v1",
+        ):
+            result = _build_models_json(
+                "https://workspace.example.com", "tok", {"openai": base_url}
+            )
+            p = result["providers"]
+            self.assertEqual(p["databricks-openai"]["baseUrl"], base_url, base_url)
+            # The completions providers share the discriminator — a
+            # misclassification here would silently re-route them too.
+            self.assertEqual(p["databricks"]["baseUrl"], base_url, base_url)
+            self.assertEqual(p["databricks-completions"]["baseUrl"], base_url, base_url)
+
+    def test_responses_run_model_registers_on_routed_provider(self):
+        # Routing concern, kept separate from base-URL selection: gpt-5.5 needs
+        # the Responses API, so it must register under that provider.
+        result = _build_models_json(
+            "https://openai.example.com",
+            "tok",
+            {"openai": "https://openai.example.com/v1"},
+            model="gpt-5.5",
+        )
         self.assertEqual(_pi_provider_for_model("gpt-5.5"), "databricks-openai")
+        provider = result["providers"]["databricks-openai"]
         self.assertIn("gpt-5.5", [entry.get("id") for entry in provider["models"]])
 
     def test_api_key_set(self):
