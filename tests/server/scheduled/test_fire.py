@@ -996,12 +996,54 @@ async def test_managed_sandbox_is_skipped_and_recorded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_native_harness_run_forces_permission_bypass() -> None:
-    """A scheduled native-terminal run launches with the harness bypass flag.
+async def test_native_harness_run_applies_spec_declared_permission_mode() -> None:
+    """A scheduled native run launches with the mode the BUNDLE declared.
 
-    A scheduled task has no human to answer a native harness's tool-permission
-    prompt, so the fire path must force the don't-prompt flag or the terminal
-    parks on readiness. omnigent's own policy hook still gates tool use.
+    The fire path must not synthesize a mode: forcing one overrides a bundle
+    that chose a stricter mode and silences the user's consent gate, and a mode
+    the CLI rejects (e.g. bypass under root) exits 1 at launch as
+    ``required_terminal_exited``.
+    """
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="news",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "claude-native", "permission_mode": "auto"},
+        ),
+    )
+    conv_store = FakeConversationStore()
+    agent_store = FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="bundle://ag_1")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            agent_store=agent_store,
+            agent_cache=FakeAgentCache(spec),
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["terminal_launch_args"] == ["--permission-mode", "auto"]
+
+
+@pytest.mark.asyncio
+async def test_native_harness_run_does_not_synthesize_a_permission_mode() -> None:
+    """A bundle that declares no mode launches at the harness default.
+
+    Synthesizing one here overrode the bundle author's choice and stripped the
+    user's consent gate; it also broke every root-daemon host, where Claude Code
+    refuses permission bypass and exits 1 before the terminal is ready.
     """
     from omnigent.spec.types import AgentSpec, ExecutorSpec
 
@@ -1030,10 +1072,7 @@ async def test_native_harness_run_forces_permission_bypass() -> None:
     await _drain()
 
     assert len(conv_store.created) == 1
-    assert conv_store.created[0]["terminal_launch_args"] == [
-        "--permission-mode",
-        "bypassPermissions",
-    ]
+    assert conv_store.created[0]["terminal_launch_args"] is None
 
 
 @pytest.mark.asyncio
@@ -1067,6 +1106,8 @@ async def test_non_native_harness_run_sets_no_launch_args() -> None:
 
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["terminal_launch_args"] is None
+
+
 # ── build_run_now (manual "run now" trigger) ─────────────────────────────────
 
 
