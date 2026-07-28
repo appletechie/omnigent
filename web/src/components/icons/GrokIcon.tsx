@@ -1,4 +1,4 @@
-import { type SVGProps } from "react";
+import type { SVGProps } from "react";
 
 // Grok (xAI) mark — the slashed diagonal glyph, currentColor so it inherits the
 // surrounding text color like the other harness icons.

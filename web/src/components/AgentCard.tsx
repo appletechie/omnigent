@@ -3,7 +3,6 @@ import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
-import { DroidIcon } from "@/components/icons/DroidIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
 import { GrokIcon } from "@/components/icons/GrokIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
@@ -59,9 +58,8 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   // Both the native (`antigravity-native`) and SDK (`antigravity`) harnesses
   // share the Antigravity glyph.
   if (agent.harness?.includes("antigravity")) return AntigravityIcon;
-  // Generic-ACP agents carry the concrete tool in their `acp:<slug>` harness id.
+  // Grok Build is a first-class harness; its agents carry `grok` in the harness id.
   if (agent.harness?.includes("grok")) return GrokIcon;
-  if (agent.harness?.includes("droid")) return DroidIcon;
   return BotIcon;
 }
 
