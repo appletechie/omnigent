@@ -238,6 +238,12 @@ _CURSOR_NATIVE_WRAPPER_LABEL_VALUE = CURSOR_NATIVE_CODING_AGENT.wrapper_label
 _CURSOR_NATIVE_HARNESS = CURSOR_NATIVE_CODING_AGENT.harness
 
 
+# Generic-ACP sessions aren't a NativeCodingAgent, but they own a model list
+# (ACP SessionModelState) — this wrapper label lets the model-options fetch and
+# the web picker recognize them without a native-agent registration.
+_ACP_WRAPPER_LABEL_VALUE = "acp-native-ui"
+
+
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 
 
@@ -723,6 +729,7 @@ def get_server_host_registry() -> HostRegistry | None:
 __all__ = [
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
+    "_ACP_WRAPPER_LABEL_VALUE",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_APPROVAL_TYPE",
