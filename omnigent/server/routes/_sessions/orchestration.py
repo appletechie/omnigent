@@ -7219,6 +7219,34 @@ async def _resolve_native_smart_routing(
     return native_agent.agent_name, model, verdict, None
 
 
+def _is_acp_harness_override(harness_override: str) -> bool:
+    """Whether *harness_override* selects an ACP-backed session.
+
+    Covers every spelling the override can be stored as:
+
+    - the concrete ``acp:<slug>`` a picker sends,
+    - the bare ``acp`` it canonicalizes to when the slug is folded away
+      (matching only the former would make this dead code wherever the slug
+      does not survive validation),
+    - a builtin ACP CLI harness id or alias, e.g. ``grok`` / ``grok-build``.
+
+    The builtin ids are read from :data:`ACP_CLI_HARNESSES` rather than listed
+    here, so a harness added to that catalog is recognized without a second
+    edit in this module.
+
+    :param harness_override: The session's stored harness override.
+    :returns: ``True`` for an ACP-backed session.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    if harness_override == "acp" or harness_override.startswith("acp:"):
+        return True
+    return any(
+        harness_override == key or harness_override in row.aliases
+        for key, row in ACP_CLI_HARNESSES.items()
+    )
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -7732,13 +7760,12 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv
-    elif conv.harness_override and (
-        conv.harness_override.startswith("acp:") or conv.harness_override in ("grok", "grok-build")
-    ):
-        # Generic-ACP session (acp:<slug>) or the builtin ``grok`` ACP harness:
-        # tag it so the web model picker and the model-options fetch recognize it
-        # — ACP agents own their model list (SessionModelState) but have no
-        # native-agent registration to carry the wrapper label.
+    elif conv.harness_override and _is_acp_harness_override(conv.harness_override):
+        # ACP-backed session (bare ``acp``, ``acp:<slug>``, or a builtin ACP CLI
+        # harness like ``grok``): tag it so the web model picker and the
+        # model-options fetch recognize it — ACP agents own their model list
+        # (SessionModelState) but have no native-agent registration to carry the
+        # wrapper label.
         #
         # Ordered BEFORE the REPL-terminal arm below because ACP is a non-native
         # harness: that arm matches every host-bound top-level ACP session, and
