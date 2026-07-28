@@ -95,7 +95,30 @@ def test_deregister_noop_for_unknown() -> None:
     registration; it must not raise.
     """
     registry = HostRegistry()
-    registry.deregister("host_nonexistent")
+    assert registry.deregister("host_nonexistent") is None
+
+
+def test_deregister_guard_keeps_reconnected_connection() -> None:
+    """
+    Verify a stale teardown can't evict the connection that replaced it.
+
+    A host that reconnects before its old tunnel finishes tearing down
+    registers a new connection; the old handler's deregister must not
+    remove it. Without the guard the caller also flips the live host's
+    row offline, and the ping loop's heartbeat never restores it.
+    """
+    registry = HostRegistry()
+    old = registry.register("host_ccc", FakeWebSocket(), _make_hello(), owner="carol")
+    new = registry.register("host_ccc", FakeWebSocket(), _make_hello(), owner="carol")
+
+    # Stale handler tears down after the reconnect: no removal, so its
+    # caller skips set_offline.
+    assert registry.deregister("host_ccc", conn=old) is None
+    assert registry.get("host_ccc") is new
+
+    # The current connection's own teardown still removes it.
+    assert registry.deregister("host_ccc", conn=new) is new
+    assert registry.get("host_ccc") is None
 
 
 def test_online_host_ids() -> None:
