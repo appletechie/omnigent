@@ -4868,26 +4868,22 @@ def _build_model_readout_lines(
     )
     from omnigent.onboarding.provider_config import (
         PI_SURFACE,
+        _harness_owns_its_credential,
         describe_active_credential,
         harness_family,
         load_providers,
         provider_families,
     )
 
-    # ACP-based harnesses — the generic ``acp:<slug>`` agents and the builtin
-    # ``grok`` — own their own auth and model. There is no Omnigent provider
-    # credential to describe, so describe_active_credential would fall back to
-    # the fleet default and mislead (report gpt-5.5 for a droid session). Report
-    # the session's own model instead; a ``/model <name>`` pick applies live via
-    # the agent's ``session/set_model``.
-    if harness and (harness in ("acp", "grok") or harness.startswith("acp:")):
-        current = model_override or "the agent's own default"
-        return [
-            f"Active:  {current}  ·  🤖 ACP agent (owns its model + auth)",
-            "  /model <name> switches the model on the agent (its own model list).",
-        ]
-
     lines: list[str] = []
+    if harness and _harness_owns_its_credential(harness):
+        # The external agent authenticates itself and chooses its own model,
+        # so there is no Omnigent credential to name and an Omnigent-side
+        # /model override does not reach it.
+        return [
+            "Active:  the agent's own model  ·  🤖 ACP agent (owns its model + auth)",
+            "  set the model in the agent's own config or launch command.",
+        ]
     cred = describe_active_credential(config, harness, model_override=model_override)
     if cred is None:
         # Nothing resolves for this harness's surface — not in the explicit

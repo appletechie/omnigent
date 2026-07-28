@@ -3054,16 +3054,47 @@ def test_resume_hint_appends_resume_flag_to_invocation_parts() -> None:
 
 
 def test_model_readout_acp_harness_reports_agent_not_provider() -> None:
-    """ACP-based harnesses own their model — the readout must not fall back to a
-    misleading Omnigent provider credential (e.g. gpt-5.5)."""
+    """
+    ACP-backed harnesses must not report an Omnigent provider credential.
+
+    ``acp``/``acp:<slug>``/``goose``/``qwen`` aren't in ``_HARNESS_FAMILY``,
+    so ``default_provider_for_harness`` used to fall through to the
+    configured anthropic/openai default and the readout named a model and
+    credential the session never touches. A failure here means that
+    fabrication is back.
+    """
     from omnigent.repl._repl import _build_model_readout_lines
 
-    for harness in ("acp", "grok", "acp:droid"):
-        lines = _build_model_readout_lines({}, harness, "claude-fable-5")
+    for harness in ("acp", "acp:droid", "goose", "qwen"):
+        lines = _build_model_readout_lines({}, harness, None)
         assert any("ACP agent" in line for line in lines), (harness, lines)
-        assert any("claude-fable-5" in line for line in lines), (harness, lines)
-        assert not any("gpt-5.5" in line for line in lines), (harness, lines)
+        # No provider/credential fabrication, and no claim that an
+        # Omnigent-side /model override reaches the agent.
+        assert not any("API Key" in line for line in lines), (harness, lines)
+        assert not any("/model <name> switches" in line for line in lines), (harness, lines)
 
-    # No override -> the agent's own default, still no provider fabrication.
-    lines = _build_model_readout_lines({}, "acp:droid", None)
-    assert any("agent's own default" in line for line in lines), lines
+
+def test_describe_active_credential_returns_none_for_acp_harnesses() -> None:
+    """
+    The resolver, not just the readout, must decline ACP harnesses.
+
+    ``_resolve_startup_header`` calls ``describe_active_credential``
+    independently of the ``/model`` readout, so fixing only the readout
+    would leave the startup banner naming the same wrong credential.
+    """
+    from omnigent.onboarding.provider_config import describe_active_credential
+
+    config = {
+        "providers": {
+            "claude-subscription": {
+                "kind": "subscription",
+                "cli": "claude",
+                "default": "anthropic",
+            }
+        }
+    }
+    for harness in ("acp", "acp:droid", "goose", "qwen"):
+        assert describe_active_credential(config, harness) is None, harness
+    # A non-ACP harness on the same config still resolves normally, proving
+    # the new short-circuit is scoped to ACP and didn't blank the resolver.
+    assert describe_active_credential(config, "claude-sdk") is not None
