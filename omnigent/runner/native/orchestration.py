@@ -67,15 +67,6 @@ _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
 
-_BACKGROUND_TITLE_HARNESS_ADAPTERS = {
-    "claude-sdk": "claude-sdk",
-    "claude-native": "claude-sdk",
-    "codex": "codex",
-}
-_BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
-_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32
-_BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS = 60.0
-
 
 def _publish_tmux_target_for_bridge(
     *,
@@ -1857,6 +1848,7 @@ async def _auto_create_pi_terminal(
     # terminal_launch_args, or when no usable provider is configured (Pi then
     # falls back to its own login). Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
+    credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
             pi_native_provider_launch,
@@ -1876,6 +1868,7 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
+            credential_warning = provider.credential_warning
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -1913,7 +1906,63 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
+    # Surface an unresolved-credential warning to the session. Without it, a Pi
+    # session whose Databricks token can't be refreshed launches fine but every
+    # message silently fails to reach the model — the user sees no reply and no
+    # reason. Best-effort: a delivery failure must not fail the launch.
+    if credential_warning is not None:
+        await _post_pi_native_credential_warning(
+            session_id=session_id,
+            server_client=server_client,
+            warning=credential_warning,
+        )
     return terminal_view
+
+
+async def _post_pi_native_credential_warning(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    warning: str,
+) -> None:
+    """Surface a credential warning into the session as an error banner.
+
+    Posts an ``error`` item via ``external_conversation_item`` so the notice
+    renders as the web UI's distinct destructive banner (not a misleading
+    assistant bubble), persists across reload, and — because ``error`` is a
+    non-content item type — never enters the next turn's model context. The
+    event persists without queuing an agent turn, so it's safe on a session
+    whose model is unreachable.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client (``None`` in tests).
+    :param warning: The user-facing warning text to surface.
+    """
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "execution",
+                        "code": "pi_credentials_unresolved",
+                        "message": warning,
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "pi-native: failed to surface credential warning for session %s",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _auto_create_cursor_terminal(
@@ -2126,7 +2175,10 @@ async def _auto_create_cursor_terminal(
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
-    from omnigent.cursor_native_permissions import supervise_cursor_transcript_elicitations
+    from omnigent.cursor_native_permissions import (
+        cursor_launch_args_enable_yolo,
+        supervise_cursor_transcript_elicitations,
+    )
     from omnigent.cursor_native_usage import supervise_cursor_usage_forwarder
 
     if server_client is not None and ensure_comment_relay is not None:
@@ -2171,6 +2223,12 @@ async def _auto_create_cursor_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
+                # Yolo / force sessions still sometimes leave pending markers;
+                # answer those in-pane instead of mirroring a card to a parent
+                # that cannot click it.
+                auto_accept_approvals=cursor_launch_args_enable_yolo(
+                    launch_config.terminal_launch_args
+                ),
             ),
             supervise_cursor_usage_forwarder(
                 base_url=server_url,
@@ -3713,6 +3771,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url=codex_ws_url,
                 codex_home=codex_home,
                 event_client=event_client,
+                routing_summary=_codex_launch.summary,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -3748,6 +3807,7 @@ async def _codex_discover_thread_and_forward(
     codex_ws_url: str,
     codex_home: Path,
     event_client: CodexAppServerClient,
+    routing_summary: str,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -3768,6 +3828,10 @@ async def _codex_discover_thread_and_forward(
     :param codex_home: Per-session private ``CODEX_HOME`` path.
     :param event_client: Connected app-server listener that will observe the
         TUI's ``thread/started``; reused to subscribe the forwarder.
+    :param routing_summary: One-line description of the resolved launch
+        routing (provider / profile / model, or the login-fallback state),
+        threaded into the startup-timeout error so hosted users can diagnose
+        without runner-log access (see #2745).
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
@@ -3804,8 +3868,8 @@ async def _codex_discover_thread_and_forward(
             write_bridge_startup_error(
                 bridge_dir,
                 f"Codex app-server never started a thread ({cause}: "
-                f"{type(exc).__name__}). See the runner log near 'native-codex "
-                "routing' for the resolved provider/model.",
+                f"{type(exc).__name__}). Launch routing: {routing_summary}. "
+                "(The runner log has the same near 'native-codex routing'.)",
             )
             return
 
@@ -4675,6 +4739,12 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     """
     Read the Codex model default from a resolved agent spec.
 
+    Reads the canonical ``spec.executor.model`` field (the same field the
+    in-process codex harness consumes via ``_resolve_spec_model``), falling
+    back to ``executor.config["model"]`` for bundle specs that pin the model
+    inside the harness config block. Gateway-routed ``databricks-*`` ids are
+    valid Codex models on the Databricks path, so they pass through.
+
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
     :returns: Model id, e.g. ``"gpt-5.4-mini"``, or ``None``.
@@ -4682,8 +4752,11 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
         return None
-    model = spec.executor.config.get("model")
-    return model if isinstance(model, str) and model else None
+    model = spec.executor.model
+    if isinstance(model, str) and model:
+        return model
+    config_model = spec.executor.config.get("model")
+    return config_model if isinstance(config_model, str) and config_model else None
 
 
 def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
