@@ -96,5 +96,4 @@ lint-all: _ensure-uv
 
 [group('lint')]
 normalize-locks: _ensure-uv
-    uv run scripts/normalize_package_lock_registry.py editors/vscode/package-lock.json || true
     uv run scripts/normalize_uv_lock_registry.py uv.lock || true

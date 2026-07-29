@@ -72,6 +72,7 @@ from omnigent.runner.native import (
     _COST_POPUP_REPOP_TASKS,
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
+    NativeLaunchContext,
     ResolvedSpec,
     _antigravity_native_terminal_arrives_via_transfer,
     _auto_create_antigravity_terminal,
@@ -101,12 +102,14 @@ from omnigent.runner.native import (
     _is_runner_owned_antigravity_terminal,
     _is_runner_owned_codex_terminal,
     _is_spec_local_native_python_tool,
+    _launch_native_terminal,
     _log_terminal_lookup_miss,
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
     _publish_tmux_target_for_bridge,
     _required_runner_env,
+    _resolve_native_spawn_env,
     _resolve_opencode_compact_model,
     _resolved_spec_workdir,
     _resolved_workdir_for_spec,
@@ -129,6 +132,12 @@ from omnigent.runner.session_init_protocol import (
     parse_runner_session_init_envelope,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.prompt import (
+    SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
+    input_items_have_multiple_authors,
+    prepare_input_items_for_model,
+    shared_message_attribution_enabled,
+)
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -912,6 +921,8 @@ class _SubagentWorkEntry:
     :param wrapper_label: Optional terminal wrapper label from the
         child session, e.g. ``"codex-native-ui"`` for codex-native
         native sub-agents.
+    :param created_by: Human actor that dispatched this child turn, if
+        known from the parent turn context.
     :param status: Current work status, e.g. ``"launching"`` or
         ``"running"``.
     :param output: Terminal child output or error text. ``None``
@@ -929,6 +940,7 @@ class _SubagentWorkEntry:
     agent: str
     title: str
     wrapper_label: str | None = None
+    created_by: str | None = None
     status: str = "launching"
     output: str | None = None
     created_at: float = dataclasses.field(default_factory=time.time)
@@ -970,6 +982,7 @@ def register_subagent_work(
     agent: str,
     title: str,
     wrapper_label: str | None = None,
+    created_by: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -985,6 +998,8 @@ def register_subagent_work(
     :param title: Sub-agent instance title, e.g. ``"auth"``.
     :param wrapper_label: Optional child ``omnigent.wrapper``
         label, e.g. ``"claude-code-native-ui"``.
+    :param created_by: Human actor that dispatched this child turn, if
+        known from the parent turn context.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -1002,6 +1017,7 @@ def register_subagent_work(
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
+        created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -1266,6 +1282,8 @@ async def _deliver_subagent_wake_post(
     server_client: httpx.AsyncClient,
     parent_id: str,
     notice: str,
+    *,
+    created_by: str | None = None,
 ) -> bool:
     """
     POST a sub-agent wake notice with a bounded retry on transient failure.
@@ -1281,9 +1299,12 @@ async def _deliver_subagent_wake_post(
     :param server_client: Omnigent HTTP client for the runner subprocess.
     :param parent_id: Parent session to wake, e.g. ``"conv_parent123"``.
     :param notice: The ``[System: ...]`` notice text to inject.
+    :param created_by: Human actor that dispatched the completed child
+        turn, if known.
     :returns: ``True`` if a 2xx was confirmed, ``False`` if every attempt
         failed (transport error, timeout, or non-2xx response).
     """
+    attribution_created_by = created_by
     for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
         try:
             resp = await server_client.post(
@@ -1294,6 +1315,11 @@ async def _deliver_subagent_wake_post(
                         "role": "user",
                         "content": [{"type": "input_text", "text": notice}],
                     },
+                    **(
+                        {"created_by": attribution_created_by}
+                        if attribution_created_by is not None
+                        else {}
+                    ),
                 },
                 # The server gates this injected wake at the parent's REQUEST
                 # phase, which can PARK on a human ASK (e.g. session_cost_budget)
@@ -1312,6 +1338,18 @@ async def _deliver_subagent_wake_post(
             resp.raise_for_status()
             return True
         except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            if (
+                attribution_created_by is not None
+                and isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code == 403
+            ):
+                _logger.debug(
+                    "Sub-agent wake POST attribution rejected for parent=%s; "
+                    "retrying without actor",
+                    parent_id,
+                )
+                attribution_created_by = None
+                continue
             last_attempt = attempt >= _WAKE_POST_MAX_ATTEMPTS
             retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
             _logger.debug(
@@ -1822,6 +1860,7 @@ def create_runner_app(
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
+    _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
@@ -2535,93 +2574,13 @@ def create_runner_app(
                 workdir=_resolved_spec_workdir(spec_entry),
                 cwd=await _session_runtime_cwd(session_id),
             )
-            if harness_name == "claude-native" and spawn_env is None:
-                from omnigent.claude_native_bridge import (
-                    build_claude_native_spawn_env,
-                )
-
-                bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            if spawn_env is None:
+                spawn_env = await _resolve_native_spawn_env(
+                    harness_name,
+                    session_id,
                     server_client=server_client,
-                    session_id=session_id,
-                    session_labels=init_context.labels,
+                    optional_labels=init_context.labels,
                 )
-                spawn_env = build_claude_native_spawn_env(session_id, bridge_id=bridge_id)
-            if harness_name == "codex-native" and spawn_env is None:
-                from omnigent.codex_native_bridge import (
-                    CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-                    build_codex_native_spawn_env,
-                )
-
-                labels = await _session_labels_for_runner_spawn(
-                    server_client=server_client,
-                    session_id=session_id,
-                )
-                bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-                spawn_env = build_codex_native_spawn_env(session_id, bridge_id=bridge_id)
-            if harness_name == "pi-native" and spawn_env is None:
-                from omnigent.pi_native_bridge import build_pi_native_spawn_env
-
-                spawn_env = build_pi_native_spawn_env(session_id)
-            if harness_name == "opencode-native" and spawn_env is None:
-                from omnigent.opencode_native_bridge import (
-                    OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
-                    build_opencode_native_spawn_env,
-                )
-
-                labels = await _session_labels_for_runner_spawn(
-                    server_client=server_client,
-                    session_id=session_id,
-                )
-                bridge_id = labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY)
-                spawn_env = build_opencode_native_spawn_env(session_id, bridge_id=bridge_id)
-            if harness_name == "cursor-native" and spawn_env is None:
-                from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
-
-                spawn_env = build_cursor_native_spawn_env(session_id)
-            if harness_name == "kiro-native" and spawn_env is None:
-                from omnigent.kiro_native_bridge import build_kiro_native_spawn_env
-
-                spawn_env = build_kiro_native_spawn_env(session_id)
-            if harness_name == "antigravity-native" and spawn_env is None:
-                from omnigent.antigravity_native_bridge import (
-                    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-                    build_antigravity_native_spawn_env,
-                )
-
-                labels = await _session_labels_for_runner_spawn(
-                    server_client=server_client,
-                    session_id=session_id,
-                )
-                antigravity_bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
-                spawn_env = build_antigravity_native_spawn_env(
-                    session_id, bridge_id=antigravity_bridge_id
-                )
-            if harness_name == "goose-native" and spawn_env is None:
-                from omnigent.goose_native_bridge import build_goose_native_spawn_env
-
-                spawn_env = build_goose_native_spawn_env(session_id)
-            if harness_name == "hermes-native" and spawn_env is None:
-                from omnigent.hermes_native_bridge import (
-                    bridge_dir_for_session_id as _hermes_bridge_dir,
-                )
-                from omnigent.hermes_native_bridge import (
-                    build_hermes_native_spawn_env,
-                    write_policy_hook_config,
-                )
-
-                _h_server_url = os.environ.get(
-                    "RUNNER_SERVER_URL", "http://localhost:6767"
-                ).rstrip("/")
-                write_policy_hook_config(_hermes_bridge_dir(session_id), _h_server_url, session_id)
-                spawn_env = build_hermes_native_spawn_env(session_id)
-            if harness_name == "qwen-native" and spawn_env is None:
-                from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
-
-                spawn_env = build_qwen_native_spawn_env(session_id)
-            if harness_name == "kimi-native" and spawn_env is None:
-                from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
-
-                spawn_env = build_kimi_native_spawn_env(session_id)
             _session_spec_cache[session_id] = spec_entry
         else:
             harness_name = "runner-test-default"
@@ -2835,105 +2794,46 @@ def create_runner_app(
                     )
 
         if harness_name == "pi-native":
-            _pi_ensure_lock = _pi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _pi_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_pi_terminal = (
-                    _tr is not None and _tr.get(session_id, "pi", "main") is not None
-                )
-                if not _has_pi_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        _pi_spec = await _resolve_session_agent_spec(session_id)
-                        await _auto_create_pi_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            agent_spec=_pi_spec,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create pi terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Pi",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            # pi resolves its spec unwrapped — a resolution error surfaces as a
+            # terminal-start error (preserved by not swallowing in the resolver).
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                ),
+                ensure_locks=_pi_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec(session_id),
+            )
 
         if harness_name == "cursor-native":
-            _cursor_ensure_lock = _cursor_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_cursor_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
             )
-            async with _cursor_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_cursor_terminal = (
-                    _tr is not None and _tr.get(session_id, "cursor", "main") is not None
-                )
-                if not _has_cursor_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        try:
-                            _cursor_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _cursor_spec = None
-                        await _auto_create_cursor_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                            agent_spec=_cursor_spec,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create cursor terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Cursor",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "kiro-native":
-            _kiro_ensure_lock = _kiro_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _kiro_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_kiro_terminal = (
-                    _tr is not None and _tr.get(session_id, "kiro", "main") is not None
-                )
-                if not _has_kiro_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_kiro_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create kiro terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Kiro",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_kiro_terminal_ensure_locks,
+            )
 
         if harness_name == "antigravity-native":
             _antigravity_ensure_lock = _antigravity_terminal_ensure_locks.setdefault(
@@ -2997,175 +2897,71 @@ def create_runner_app(
                     )
 
         if harness_name == "opencode-native":
-            _opencode_ensure_lock = _opencode_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_opencode_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
             )
-            async with _opencode_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_opencode_terminal = (
-                    _tr is not None and _tr.get(session_id, "opencode", "main") is not None
-                )
-                if not _has_opencode_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        try:
-                            _opencode_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _opencode_spec = None
-                        await _auto_create_opencode_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            agent_spec=_opencode_spec,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create opencode terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "OpenCode",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "goose-native":
-            _goose_ensure_lock = _goose_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_goose_terminal_ensure_locks,
             )
-            async with _goose_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_goose_terminal = (
-                    _tr is not None and _tr.get(session_id, "goose", "main") is not None
-                )
-                if not _has_goose_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_goose_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create goose terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Goose",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "hermes-native":
-            _hermes_ensure_lock = _hermes_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_hermes_terminal_ensure_locks,
             )
-            async with _hermes_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_hermes_terminal = (
-                    _tr is not None and _tr.get(session_id, "hermes", "main") is not None
-                )
-                if not _has_hermes_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_hermes_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create hermes terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Hermes",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
 
         if harness_name == "qwen-native":
-            _qwen_ensure_lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _qwen_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_qwen_terminal = (
-                    _tr is not None and _tr.get(session_id, "qwen", "main") is not None
-                )
-                if not _has_qwen_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        await _auto_create_qwen_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create qwen terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "qwen",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_qwen_terminal_ensure_locks,
+            )
 
         if harness_name == "kimi-native":
-            _kimi_ensure_lock = _kimi_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
-            async with _kimi_ensure_lock:
-                _tr = resource_registry.terminal_registry
-                _has_kimi_terminal = (
-                    _tr is not None and _tr.get(session_id, "kimi", "main") is not None
-                )
-                if not _has_kimi_terminal:
-                    _publish_terminal_pending(_publish_event, session_id, True)
-                    try:
-                        try:
-                            _kimi_spec = await _resolve_session_agent_spec(session_id)
-                        except OmnigentError:
-                            _kimi_spec = None
-                        await _auto_create_kimi_terminal(
-                            session_id,
-                            resource_registry,
-                            _publish_event,
-                            server_client=server_client,
-                            ensure_comment_relay=_ensure_comment_relay_started,
-                            agent_spec=_kimi_spec,
-                        )
-                    except Exception as exc:
-                        _logger.exception(
-                            "Failed to auto-create kimi terminal for %s",
-                            session_id,
-                        )
-                        _publish_native_terminal_start_error(
-                            _publish_event,
-                            session_id,
-                            "Kimi",
-                            exc,
-                        )
-                    finally:
-                        _publish_terminal_pending(_publish_event, session_id, False)
+            await _launch_native_terminal(
+                harness_name,
+                NativeLaunchContext(
+                    session_id=session_id,
+                    resource_registry=resource_registry,
+                    publish_event=_publish_event,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                ),
+                ensure_locks=_kimi_terminal_ensure_locks,
+                resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(session_id),
+            )
 
         if (
             spec is not None
@@ -3458,6 +3254,7 @@ def create_runner_app(
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
         _session_histories.pop(session_id, None)
+        _author_attribution_sessions.discard(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -3642,13 +3439,14 @@ def create_runner_app(
             ):
                 _skipped_types.append(str(item_type))
             if item_type == "message":
-                result.append(
-                    {
-                        "type": "message",
-                        "role": item.get("role", "user"),
-                        "content": item.get("content", []),
-                    }
-                )
+                message = {
+                    "type": "message",
+                    "role": item.get("role", "user"),
+                    "content": item.get("content", []),
+                }
+                if item.get("created_by") is not None:
+                    message["created_by"] = item["created_by"]
+                result.append(message)
             elif item_type == "function_call":
                 result.append(
                     {
@@ -5440,6 +5238,50 @@ def create_runner_app(
             )
         await _cancel_active_turn(conv_id, expected_task=target)
 
+    def _history_message_from_body(body: dict[str, Any]) -> dict[str, Any]:
+        message = {
+            "type": "message",
+            "role": body.get("role", "user"),
+            "content": body.get("content", []),
+        }
+        if body.get("created_by") is not None:
+            message["created_by"] = body["created_by"]
+        return message
+
+    def _note_message_author(session_id: str, body: dict[str, Any]) -> None:
+        if session_id in _author_attribution_sessions:
+            return
+        if body.get("author_attribution_required") is True:
+            _author_attribution_sessions.add(session_id)
+            return
+        authors = {
+            item.get("created_by")
+            for item in _session_histories.get(session_id, [])
+            if isinstance(item.get("created_by"), str) and item.get("created_by")
+        }
+        created_by = body.get("created_by")
+        if isinstance(created_by, str) and created_by:
+            authors.add(created_by)
+        if len(authors) >= 2:
+            _author_attribution_sessions.add(session_id)
+
+    def _message_body_for_harness(
+        body: dict[str, Any],
+        *,
+        force_author_attribution: bool,
+    ) -> dict[str, Any]:
+        event = {
+            key: value
+            for key, value in body.items()
+            if key not in {"created_by", "author_attribution_required"}
+        }
+        prepared = prepare_input_items_for_model(
+            [_history_message_from_body(body)],
+            force_author_attribution=force_author_attribution,
+        )
+        event["content"] = prepared[0]["content"]
+        return event
+
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
@@ -5467,11 +5309,7 @@ def create_runner_app(
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
-                    {
-                        "type": "message",
-                        "role": next_body.get("role", "user"),
-                        "content": next_body.get("content", []),
-                    }
+                    _history_message_from_body(next_body)
                 )
             else:
                 all_bodies = list(buf)
@@ -5480,11 +5318,7 @@ def create_runner_app(
 
                 for body in all_bodies:
                     _session_histories.setdefault(session_id, []).append(
-                        {
-                            "type": "message",
-                            "role": body.get("role", "user"),
-                            "content": body.get("content", []),
-                        }
+                        _history_message_from_body(body)
                     )
                 next_body = all_bodies[-1]
 
@@ -5504,8 +5338,12 @@ def create_runner_app(
                 _ingest_now_serving[session_id] = _seq + 1
                 _cond.notify_all()
 
-    async def _post_subagent_wake_notice(parent_id: str, notice: str, child_id: str) -> None:
-        delivered = await _deliver_subagent_wake_post(server_client, parent_id, notice)
+    async def _post_subagent_wake_notice(
+        parent_id: str, notice: str, child_id: str, created_by: str | None
+    ) -> None:
+        delivered = await _deliver_subagent_wake_post(
+            server_client, parent_id, notice, created_by=created_by
+        )
         if not delivered:
             _subagent_wake_pending.discard(parent_id)
             _logger.warning(
@@ -5536,7 +5374,12 @@ def create_runner_app(
             pending=inbox.qsize(),
         )
         _wake_task = loop.create_task(
-            _post_subagent_wake_notice(entry.parent_session_id, notice, entry.child_session_id)
+            _post_subagent_wake_notice(
+                entry.parent_session_id,
+                notice,
+                entry.child_session_id,
+                entry.created_by,
+            )
         )
         _wake_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_wake_task)
@@ -5778,6 +5621,10 @@ def create_runner_app(
             _session_histories[conv] = (
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
+        if conv not in _author_attribution_sessions and input_items_have_multiple_authors(
+            _session_histories[conv]
+        ):
+            _author_attribution_sessions.add(conv)
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -5790,7 +5637,17 @@ def create_runner_app(
             )
             from omnigent.runtime.prompt import build_instructions
 
-            instructions = build_instructions(cached_spec, None, [])
+            framework_instructions = (
+                (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
+                if shared_message_attribution_enabled() and conv in _author_attribution_sessions
+                else ()
+            )
+            instructions = build_instructions(
+                cached_spec,
+                None,
+                [],
+                framework_instructions=framework_instructions,
+            )
 
         ctx = TurnDispatch(
             agent_id=msg_body.get("agent_id"),
@@ -5809,7 +5666,14 @@ def create_runner_app(
             "model": msg_body.get("model", ""),
         }
         if _session_histories[conv]:
-            harness_body["content"] = _session_histories[conv]
+            history = _session_histories[conv]
+            if any("created_by" in item for item in history):
+                harness_body["content"] = prepare_input_items_for_model(
+                    history,
+                    force_author_attribution=conv in _author_attribution_sessions,
+                )
+            else:
+                harness_body["content"] = history
         else:
             harness_body["content"] = msg_body.get(
                 "content",
@@ -6053,91 +5917,13 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
-        if harness_name == "claude-native" and spawn_env is None:
-            from omnigent.claude_native_bridge import build_claude_native_spawn_env
-
-            bridge_id = await _claude_native_bridge_id_with_optional_labels(
+        if spawn_env is None:
+            spawn_env = await _resolve_native_spawn_env(
+                harness_name,
+                conv_id,
                 server_client=server_client,
-                session_id=conv_id,
-                session_labels=startup_labels,
+                optional_labels=startup_labels,
             )
-            spawn_env = build_claude_native_spawn_env(conv_id, bridge_id=bridge_id)
-        if harness_name == "codex-native" and spawn_env is None:
-            from omnigent.codex_native_bridge import (
-                CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
-                build_codex_native_spawn_env,
-            )
-
-            labels = await _session_labels_for_runner_spawn(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-            spawn_env = build_codex_native_spawn_env(conv_id, bridge_id=bridge_id)
-        if harness_name == "pi-native" and spawn_env is None:
-            from omnigent.pi_native_bridge import build_pi_native_spawn_env
-
-            spawn_env = build_pi_native_spawn_env(conv_id)
-        if harness_name == "opencode-native" and spawn_env is None:
-            from omnigent.opencode_native_bridge import (
-                OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
-                build_opencode_native_spawn_env,
-            )
-
-            labels = await _session_labels_for_runner_spawn(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            bridge_id = labels.get(OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY)
-            spawn_env = build_opencode_native_spawn_env(conv_id, bridge_id=bridge_id)
-        if harness_name == "cursor-native" and spawn_env is None:
-            from omnigent.cursor_native_bridge import build_cursor_native_spawn_env
-
-            spawn_env = build_cursor_native_spawn_env(conv_id)
-        if harness_name == "kiro-native" and spawn_env is None:
-            from omnigent.kiro_native_bridge import build_kiro_native_spawn_env
-
-            spawn_env = build_kiro_native_spawn_env(conv_id)
-        if harness_name == "antigravity-native" and spawn_env is None:
-            from omnigent.antigravity_native_bridge import (
-                ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-                build_antigravity_native_spawn_env,
-            )
-
-            labels = await _session_labels_for_runner_spawn(
-                server_client=server_client,
-                session_id=conv_id,
-            )
-            antigravity_bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY)
-            spawn_env = build_antigravity_native_spawn_env(
-                conv_id, bridge_id=antigravity_bridge_id
-            )
-        if harness_name == "goose-native" and spawn_env is None:
-            from omnigent.goose_native_bridge import build_goose_native_spawn_env
-
-            spawn_env = build_goose_native_spawn_env(conv_id)
-        if harness_name == "hermes-native" and spawn_env is None:
-            from omnigent.hermes_native_bridge import (
-                bridge_dir_for_session_id as _hermes_bridge_dir2,
-            )
-            from omnigent.hermes_native_bridge import (
-                build_hermes_native_spawn_env,
-                write_policy_hook_config,
-            )
-
-            _h_server_url2 = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip(
-                "/"
-            )
-            write_policy_hook_config(_hermes_bridge_dir2(conv_id), _h_server_url2, conv_id)
-            spawn_env = build_hermes_native_spawn_env(conv_id)
-        if harness_name == "qwen-native" and spawn_env is None:
-            from omnigent.qwen_native_bridge import build_qwen_native_spawn_env
-
-            spawn_env = build_qwen_native_spawn_env(conv_id)
-        if harness_name == "kimi-native" and spawn_env is None:
-            from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
-
-            spawn_env = build_kimi_native_spawn_env(conv_id)
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -6388,11 +6174,7 @@ def create_runner_app(
                                         _session_message_buffers[conv_id] = _remaining
                                         for _m in _consumed:
                                             _session_histories.setdefault(conv_id, []).append(
-                                                {
-                                                    "type": "message",
-                                                    "role": _m.get("role", "user"),
-                                                    "content": _m.get("content", []),
-                                                }
+                                                _history_message_from_body(_m)
                                             )
                                     continue
                                 if _evt_type == "response.output_text.delta":
@@ -6696,6 +6478,7 @@ def create_runner_app(
                         session_id=conversation_id,
                         server_client=server_client,
                     )
+                _note_message_author(conversation_id, message_body)
 
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
@@ -6721,9 +6504,15 @@ def create_runner_app(
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
+                            injection_body = _message_body_for_harness(
+                                message_body,
+                                force_author_attribution=(
+                                    conversation_id in _author_attribution_sessions
+                                ),
+                            )
                             _injection_resp = await _hc.post(
                                 f"/v1/sessions/{conversation_id}/events",
-                                json=message_body,
+                                json=injection_body,
                                 timeout=5.0,
                             )
                             if _injection_resp.status_code >= 400:
@@ -6756,11 +6545,7 @@ def create_runner_app(
                         },
                     )
 
-                new_item = {
-                    "type": "message",
-                    "role": message_body.get("role", "user"),
-                    "content": message_body.get("content", []),
-                }
+                new_item = _history_message_from_body(message_body)
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:
@@ -8566,6 +8351,18 @@ def create_runner_app(
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_resolved_spec(entry) if entry is not None else None
 
+    async def _resolve_session_agent_spec_or_none(session_id: str) -> Any | None:
+        """Resolve the session agent spec, tolerating resolution failure.
+
+        The cursor/opencode/kimi launch arms swallow ``OmnigentError`` and
+        continue without a spec; this is their spec resolver for
+        ``_launch_native_terminal``.
+        """
+        try:
+            return await _resolve_session_agent_spec(session_id)
+        except OmnigentError:
+            return None
+
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
@@ -8738,6 +8535,29 @@ def create_runner_app(
                     "detail": _client_safe_error_detail(exc, context="codex-native model options"),
                 },
             )
+
+    @app.get("/v1/sessions/{session_id}/kiro-model-options")
+    async def get_session_kiro_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "kiro-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.kiro_native import list_kiro_cli_model_options
+
+        try:
+            models = await asyncio.to_thread(list_kiro_cli_model_options)
+        except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+            _logger.warning(
+                "Kiro-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "kiro_native_model_options_failed",
+                    "detail": _client_safe_error_detail(exc, context="kiro-native model options"),
+                },
+            )
+        return JSONResponse(status_code=200, content={"models": models})
 
     @app.get("/v1/sessions/{session_id}/claude-model-options")
     async def get_session_claude_model_options(session_id: str) -> JSONResponse:
@@ -9776,6 +9596,13 @@ def _build_spawn_env_from_spec(
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
     harness = canonicalize_harness(harness) or harness
+    effective_spec = spec
+    if model_override is not None:
+        executor = getattr(spec, "executor", None)
+        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+            effective_spec = spec.model_copy(
+                update={"executor": executor.model_copy(update={"model": model_override})}
+            )
     try:
         from omnigent.runtime.workflow import (
             _build_acp_spawn_env,
@@ -9792,34 +9619,34 @@ def _build_spawn_env_from_spec(
         )
 
         if harness == "claude-sdk":
-            env = _build_claude_sdk_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_claude_sdk_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "codex":
-            env = _build_codex_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "pi":
-            env = _build_pi_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_pi_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
-            env = _build_openai_agents_sdk_spawn_env(spec)
+            env = _build_openai_agents_sdk_spawn_env(effective_spec)
         elif harness == "cursor":
-            env = _build_cursor_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_cursor_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "antigravity":
-            env = _build_antigravity_spawn_env(spec)
+            env = _build_antigravity_spawn_env(effective_spec)
         elif harness == "kimi":
-            env = _build_kimi_spawn_env(spec, cwd=cwd)
+            env = _build_kimi_spawn_env(effective_spec, cwd=cwd)
         elif harness == "qwen":
-            env = _build_qwen_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_qwen_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "goose":
-            env = _build_goose_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
             env = _build_acp_spawn_env(
-                spec, cwd=cwd, workdir=workdir, override_harness=acp_override
+                effective_spec, cwd=cwd, workdir=workdir, override_harness=acp_override
             )
         elif harness == "copilot":
-            env = _build_copilot_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         else:
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:
                 builder = load_object(builder_path)
-                env = builder(spec, cwd=cwd, workdir=workdir)
+                env = builder(effective_spec, cwd=cwd, workdir=workdir)
             else:
                 # Native terminal harnesses and unknown harnesses build env elsewhere.
                 return None

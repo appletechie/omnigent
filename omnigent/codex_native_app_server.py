@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 import tomlkit
 import websockets
 
+from omnigent import model_catalog
+
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
@@ -41,7 +43,6 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
     _find_codex_cli,
-    _merge_codex_hook_trust_back,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
@@ -55,7 +56,6 @@ CodexParams = dict[str, Any]
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _STDERR_CHUNK_LIMIT = 65536
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # hooks.json filename written into the private CODEX_HOME registering the
@@ -88,6 +88,11 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # — we detect the old version up front and skip registration with a loud
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
+# Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
+# Added in openai/codex PR #21768, shipped in rust-v0.131.0 (2026-05-18).
+# Below this the flag is unknown and codex exits immediately with an error,
+# so we skip it and fall back to the old behaviour (trust prompt may appear).
+_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 
 
 def _format_codex_version(version: tuple[int, int, int] | None) -> str:
@@ -589,6 +594,7 @@ class CodexNativeAppServer:
     pinned_model: str | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
+    codex_cli_version: tuple[int, int, int] | None = None
 
     async def start(self) -> None:
         """
@@ -625,6 +631,7 @@ class CodexNativeAppServer:
         # never silently disables enforcement — a genuine trust failure is
         # then caught below.
         codex_version = await _codex_cli_version(self.codex_path)
+        self.codex_cli_version = codex_version
         if codex_version is not None and codex_version < _MIN_POLICY_HOOK_CODEX_VERSION:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
@@ -823,14 +830,6 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
-        # Flush any hook-trust the user accepted this session back into the
-        # global config so the next session's copy inherits it and
-        # _retarget_codex_hook_trust_keys can carry it forward without prompting.
-        _merge_codex_hook_trust_back(
-            self.codex_home / "config.toml",
-            _codex_home_config_source_from_env(),
-            self.codex_home,
-        )
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -954,11 +953,55 @@ def _codex_policy_hooks_settings(
     }
 
 
+def _merge_user_hooks(policy_payload: dict[str, Any], user_hooks_path: Path) -> dict[str, Any]:
+    """
+    Merge user-declared hooks into the policy hooks payload.
+
+    When a symlinked ``hooks.json`` exists in the private ``CODEX_HOME``
+    (the user's real ``~/.codex/hooks.json``), its hook entries are
+    appended after Omnigent's policy hooks for each shared event, and any
+    events declared only by the user are added wholesale. This preserves
+    all user hooks while keeping the Omnigent policy hooks in first
+    position so they always run before user hooks.
+
+    :param policy_payload: The ``hooks.json``-shaped dict built by
+        :func:`_codex_policy_hooks_settings`.
+    :param user_hooks_path: Path to the user's real ``hooks.json``; must
+        be readable.
+    :returns: Merged payload, or *policy_payload* unchanged on any read
+        or parse error (best-effort — policy enforcement must never fail
+        because the user's hooks file is malformed).
+    """
+    try:
+        user_data = json.loads(user_hooks_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return policy_payload
+    user_hooks: dict[str, Any] = user_data.get("hooks", {}) if isinstance(user_data, dict) else {}
+    if not user_hooks:
+        return policy_payload
+    merged: dict[str, Any] = dict(policy_payload)
+    merged["hooks"] = dict(policy_payload["hooks"])
+    for event, entries in user_hooks.items():
+        if not isinstance(entries, list):
+            continue
+        if event in merged["hooks"]:
+            merged["hooks"][event] = list(merged["hooks"][event]) + entries
+        else:
+            merged["hooks"][event] = entries
+    return merged
+
+
 def _write_codex_policy_hooks_file(
     codex_home: Path, bridge_dir: Path, python_executable: str | None
 ) -> None:
     """
     Write ``hooks.json`` into the private CODEX_HOME (atomically).
+
+    When ``_populate_codex_home_config`` has symlinked the user's
+    ``hooks.json`` into the private home, its entries are merged into the
+    policy hooks payload before the file is written so user hooks fire
+    alongside Omnigent's policy hooks. The symlink is replaced by a
+    regular merged file.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param bridge_dir: Native Codex bridge directory for the hook command.
@@ -968,6 +1011,9 @@ def _write_codex_policy_hooks_file(
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = codex_home / _CODEX_HOOKS_FILE
     payload = _codex_policy_hooks_settings(bridge_dir, python_executable)
+    if path.is_symlink() and path.exists():
+        payload = _merge_user_hooks(payload, path.resolve())
+        path.unlink()
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_CODEX_HOOKS_FILE}.", dir=str(codex_home))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -1222,7 +1268,8 @@ def build_codex_native_server(
         host = host.rstrip("/")
         config_overrides.extend(
             _databricks_codex_config_overrides(
-                model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
+                model=model
+                or model_catalog.resolve_catalog_model("databricks", family="openai").model_id,
                 base_url=_databricks_codex_base_url(host),
                 auth_command=_databricks_codex_auth_command(host, profile),
             )
@@ -1829,6 +1876,7 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # flag because it MUST go, the sandbox flag for hygiene so the launched arg
 # list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
+_CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
 # Granular approval/sandbox flags to drop when bypass is on. The "Full
 # access" / "Read only" approval presets emit the long ``--flag value`` form
 # (see web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
@@ -1905,6 +1953,7 @@ def build_codex_remote_args(
     remote_url: str,
     config_overrides: tuple[str, ...] = (),
     bypass_sandbox: bool = False,
+    bypass_hook_trust: bool = False,
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -1954,6 +2003,14 @@ def build_codex_remote_args(
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
         the granular flags untouched. See issue #657.
+    :param bypass_hook_trust: When ``True``, emit
+        ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
+        hooks without the interactive "Hooks need review" trust prompt.
+        Intended for runner-owned headless sessions where the private
+        ``CODEX_HOME`` is provisioned by Omnigent and there is no terminal
+        user to answer the prompt. Default ``False`` for interactive
+        ``omnigent codex`` sessions where the user faces the terminal and
+        can accept hooks normally.
     :returns: Codex argv tail after the executable.
     """
     override_args: list[str] = []
@@ -1965,6 +2022,8 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
         passthrough = normalize_codex_permission_launch_args(codex_args)
+    if bypass_hook_trust:
+        passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]

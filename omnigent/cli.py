@@ -3559,14 +3559,16 @@ def server(
     # Warn loudly when the SPA bundle is absent: the server still boots
     # but serves an API-only JSON landing at "/", so the operator hits
     # http://host:port expecting the web UI and gets JSON with no clue
-    # why. The bundle is npm-build output (not tracked in git); a dev
-    # checkout that never ran `npm run build` has an empty static dir.
+    # why. The bundle is Vite build output (not tracked in git); a dev
+    # checkout that never ran `pnpm --filter web run build` has an empty
+    # static dir.
     from omnigent.server.app import _WEB_UI_DIST
 
     if not (_WEB_UI_DIST / "index.html").is_file():
         click.echo(
             "  ⚠ web UI not built — serving API only. "
-            "Run `cd web && npm install && npm run build`, "
+            "Run `pnpm install --frozen-lockfile --filter web && "
+            "pnpm --filter web run build`, "
             "then restart (or install a release wheel/image).",
             err=True,
         )
@@ -5764,64 +5766,64 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
     "claude": _NativeTerminalDispatchSpec(
         module="omnigent.claude_native",
         function="run_claude_native",
-        args_param="claude_args",
+        args_param="extra_args",
     ),
     "codex": _NativeTerminalDispatchSpec(
         module="omnigent.codex_native",
         function="run_codex_native",
-        args_param="codex_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "pi": _NativeTerminalDispatchSpec(
         module="omnigent.pi_native",
         function="run_pi_native",
-        args_param="pi_args",
+        args_param="extra_args",
     ),
     "opencode": _NativeTerminalDispatchSpec(
         module="omnigent.opencode_native",
         function="run_opencode_native",
-        args_param="opencode_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "cursor": _NativeTerminalDispatchSpec(
         module="omnigent.cursor_native",
         function="run_cursor_native",
-        args_param="cursor_args",
+        args_param="extra_args",
     ),
     "kimi": _NativeTerminalDispatchSpec(
         module="omnigent.kimi_native",
         function="run_kimi_native",
-        args_param="kimi_args",
+        args_param="extra_args",
     ),
     "kiro": _NativeTerminalDispatchSpec(
         module="omnigent.kiro_native",
         function="run_kiro_native",
-        args_param="kiro_args",
+        args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
     ),
     "goose": _NativeTerminalDispatchSpec(
         module="omnigent.goose_native",
         function="run_goose_native",
-        args_param="goose_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
         module="omnigent.antigravity_native",
         function="run_antigravity_native",
-        args_param="antigravity_args",
+        args_param="extra_args",
         model_strategy="first_class",
     ),
     "qwen": _NativeTerminalDispatchSpec(
         module="omnigent.qwen_native",
         function="run_qwen_native",
-        args_param="qwen_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
     "hermes": _NativeTerminalDispatchSpec(
         module="omnigent.hermes_native",
         function="run_hermes_native",
-        args_param="hermes_args",
+        args_param="extra_args",
         model_strategy="explicit_passthrough",
     ),
 }

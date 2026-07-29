@@ -25,6 +25,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     session_stream,
@@ -111,8 +112,18 @@ def register_events_routes(
     runner_exit_reports: RunnerExitReports | None = None,
     host_registry: HostRegistry | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    runner_tunnel_tokens: frozenset[str] | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
+
+    def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        if not token:
+            return False
+        if runner_tunnel_tokens is not None and token in runner_tunnel_tokens:
+            return True
+        runner_id = getattr(conv, "runner_id", None)
+        return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
     @router.post(
         "/sessions/{session_id}/events",
@@ -218,6 +229,26 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        created_by = _attribution_user(user_id)
+        body_created_by = _attribution_user(body.created_by)
+        if body_created_by is not None:
+            if not _has_runner_created_by_authority(request, conv):
+                raise OmnigentError(
+                    "created_by is reserved for runner-originated session events",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            try:
+                await _require_access_and_level(
+                    body_created_by,
+                    session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                )
+            except OmnigentError:
+                pass
+            else:
+                created_by = body_created_by
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -537,6 +568,11 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
+            # Approval authorizes a tool to run with the session owner's
+            # execution identity, so shared editors may not resolve it.
+            await _require_access(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -649,7 +685,7 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
-                created_by=_attribution_user(user_id),
+                created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
             )
             return {"queued": False, "item_id": item_id}
@@ -1113,7 +1149,7 @@ def register_events_routes(
                             conversation_store,
                             launch_attempt.error,
                             runner_router,
-                            created_by=_attribution_user(user_id),
+                            created_by=created_by,
                         )
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
@@ -1197,7 +1233,7 @@ def register_events_routes(
                     conversation_store,
                     offline_error,
                     runner_router,
-                    created_by=_attribution_user(user_id),
+                    created_by=created_by,
                 )
                 return {"queued": True, "item_id": item_id}
             # Raise so the Omnigent server doesn't persist an item the
@@ -1275,7 +1311,7 @@ def register_events_routes(
                 runner_client,
                 agent=_agent,
                 has_mcp_servers=_has_mcp_servers,
-                created_by=_attribution_user(user_id),
+                created_by=created_by,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule()
@@ -1290,7 +1326,8 @@ def register_events_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
-            created_by=_attribution_user(user_id),
+            created_by=created_by,
+            author_attribution_required=(access.level is not None and access.level < LEVEL_OWNER),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
         )

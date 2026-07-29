@@ -78,6 +78,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.prompt import model_author_prefix
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
@@ -3131,6 +3132,27 @@ def _merge_pending_file_blocks(
         return item
     merged_data = item.data.model_copy(update={"content": [*file_blocks, *item.data.content]})
     return item.model_copy(update={"data": merged_data})
+
+
+def _strip_pending_author_prefix(
+    item: NewConversationItem,
+    pending_content: list[dict[str, Any]],
+    created_by: str | None,
+) -> NewConversationItem:
+    """Remove a runner-added author prefix from mirrored native text."""
+    if not isinstance(item.data, MessageData) or not created_by:
+        return item
+    original_text = _message_text(pending_content)
+    mirrored_text = _message_text(item.data.content)
+    prefix = model_author_prefix(created_by)
+    if original_text is None or mirrored_text != prefix + original_text:
+        return item
+    content = [dict(block) for block in item.data.content]
+    for block in content:
+        if block.get("type") == "input_text" and isinstance(block.get("text"), str):
+            block["text"] = block["text"][len(prefix) :]
+            break
+    return item.model_copy(update={"data": item.data.model_copy(update={"content": content})})
 
 
 def _message_text(content: list[dict[str, Any]]) -> str | None:
@@ -7999,13 +8021,12 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.model_catalog import spec_harness
-    from omnigent.server.smart_routing import fetch_runner_models, infer_models
+    from omnigent.server.smart_routing import fetch_runner_models
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
     # Keys are worker names ("self", "claude_code", etc.) as returned by
-    # catalog_for_spec.  None when runner is unreachable — falls back to
-    # infer_models static table.
+    # catalog_for_spec. None when runner discovery is unavailable.
     _runner_catalog: dict[str, list[str]] | None = None
     if session_id is not None and runner_router is not None:
         _runner_client = await _get_runner_client(session_id, runner_router)
@@ -8080,12 +8101,10 @@ async def _handle_advise_models_mcp(
                 candidates = explicit_models
             else:
                 harness_key = _resolve_harness_for_worker(agent) or agent
-                # Prefer live runner catalog (worker name or harness key);
-                # fall back to static infer_models table.
+                # Prefer the worker name, then its normalized harness key.
                 candidates = (
                     (_runner_catalog or {}).get(agent)
                     or (_runner_catalog or {}).get(harness_key)
-                    or infer_models(harness_key)
                     or []
                 )
             if candidates:
@@ -8655,6 +8674,7 @@ __all__ = [
     "_stop_session_via_runner",
     "_stored_file_to_resource",
     "_stream_live_events",
+    "_strip_pending_author_prefix",
     "_structured_ask_user_question",
     "_subagent_delivery_status",
     "_targeted_elicitation_event",

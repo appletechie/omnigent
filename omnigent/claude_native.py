@@ -47,6 +47,7 @@ import yaml
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
+from omnigent import model_catalog
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
@@ -102,6 +103,9 @@ from omnigent.native_terminal import (
 )
 from omnigent.native_terminal import (
     bind_session_runner as _bind_session_runner,
+)
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
@@ -545,7 +549,8 @@ def run_claude_native(
     *,
     server: str | None,
     session_id: str | None,
-    claude_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    claude_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str = _DEFAULT_CLAUDE_COMMAND,
     use_claude_config: bool = False,
@@ -580,6 +585,9 @@ def run_claude_native(
     :returns: None after the attach session ends.
     :raises click.ClickException: If setup, launch, or attach fails.
     """
+    claude_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=claude_args, legacy_param="claude_args"
+    )
     startup_profiler = startup_profiler or StartupProfiler.from_env(
         name="omnigent claude",
         env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -1607,10 +1615,7 @@ def _ucode_config_for_profile(
     if not profile:
         return None
 
-    from omnigent.onboarding.databricks_config import (
-        DATABRICKS_CLAUDE_DEFAULT_MODEL,
-        get_workspace_url_for_profile,
-    )
+    from omnigent.onboarding.databricks_config import get_workspace_url_for_profile
     from omnigent.onboarding.ucode_state import read_ucode_state
 
     workspace_url = get_workspace_url_for_profile(profile)
@@ -1732,7 +1737,9 @@ def _ucode_config_for_profile(
     return ClaudeNativeUcodeConfig(
         env=env,
         api_key_helper=agent_state.auth_command,
-        model=default_model or configured_default or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        model=default_model
+        or configured_default
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
     )
 
 
