@@ -680,9 +680,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "Copilot",
         "cursor": "Cursor",
         "grok": "Grok Build",
-        # openai-agents is intentionally omitted from the picker catalog: it
-        # stays a valid harness for YAML specs (and the credential-free
-        # integration mock LLM), but is no longer offered as a UI pick.
+        "openai-agents": "OpenAI Agents SDK",
         "pi": "Pi",
     },
     capabilities=_BUILTIN_CAPABILITIES,
