@@ -34,6 +34,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -761,7 +762,7 @@ def _build_models_json(
     _segments = _gateway_path_segments(raw_openai_base_url) if raw_openai_base_url else []
     is_codex_gateway = any(
         first == "ai-gateway" and second == "codex"
-        for first, second in zip(_segments, _segments[1:], strict=False)
+        for first, second in itertools.pairwise(_segments)
     )
     if is_codex_gateway:
         openai_base_url = serving_endpoints_url
