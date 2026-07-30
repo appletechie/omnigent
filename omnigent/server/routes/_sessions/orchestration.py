@@ -5257,6 +5257,53 @@ def _native_subagent_wrapper_labels(
     return _native_subagent_wrapper_labels_from_spec(sub_spec)
 
 
+def _is_acp_harness_override(harness: str | None) -> bool:
+    """Whether *harness* drives its agent over ACP.
+
+    Reads the declared capability record rather than matching names, so the
+    builtin ACP harnesses (``acp``, ``goose``, ``qwen``) and any community ACP
+    plugin are covered without editing a list here. Both spellings the override
+    can be stored as are accepted: the concrete ``acp:<slug>`` a picker sends,
+    and the bare ``acp`` it canonicalizes to when the slug is folded away —
+    matching only the former made this dead code wherever the slug did not
+    survive validation.
+
+    :param harness: A harness name, ``acp:<slug>``, or ``None``.
+    :returns: ``True`` for an ACP-backed harness.
+    """
+    if not harness:
+        return False
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_capabilities import IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
+
+    key = harness.split(":", 1)[0]
+    caps = harness_capabilities().get(canonicalize_harness(key) or key)
+    return caps is not None and caps.integration_mode is IntegrationMode.ACP_SUBPROCESS
+
+
+async def _agent_declared_harness(conv: Conversation, agent_store: AgentStore) -> str | None:
+    """Return the harness the session's agent declares, best-effort.
+
+    Used only to decide a presentation label, so a spec that cannot be loaded
+    (no runtime, missing bundle, unparsable spec) yields ``None`` rather than
+    failing the create — the session still works, it just renders without the
+    ACP model picker.
+
+    :param conv: The freshly created conversation.
+    :param agent_store: Store the agent's bundle is loaded from.
+    :returns: The declared harness, or ``None``.
+    """
+    try:
+        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    except Exception:  # noqa: BLE001 — labelling must never fail session create
+        return None
+    config = getattr(getattr(spec, "executor", None), "config", None)
+    if not isinstance(config, dict):
+        return None
+    return str(config.get("harness") or "") or None
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -5590,13 +5637,14 @@ async def _create_session_from_existing_agent(
         _merged.update(_sa_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
         conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-    elif conv.harness_override and (
-        conv.harness_override.startswith("acp:") or conv.harness_override in ("grok", "grok-build")
+    elif _is_acp_harness_override(
+        conv.harness_override or await _agent_declared_harness(conv, agent_store)
     ):
-        # Generic-ACP session (acp:<slug>) or the builtin ``grok`` ACP harness:
-        # tag it so the web model picker and the model-options fetch recognize it
-        # — ACP agents own their model list (SessionModelState) but have no
-        # native-agent registration to carry the wrapper label.
+        # ACP-backed session, either picked as an override (``acp:<slug>``) or
+        # declared by the agent itself (``harness: droid``): tag it so the web
+        # model picker and the model-options fetch recognize it — ACP agents own
+        # their model list (SessionModelState) but have no native-agent
+        # registration to carry the wrapper label.
         _acp_labels = dict(body.labels) if body.labels else {}
         _acp_labels[_CLAUDE_NATIVE_WRAPPER_LABEL_KEY] = _ACP_WRAPPER_LABEL_VALUE
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _acp_labels)

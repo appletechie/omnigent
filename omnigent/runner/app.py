@@ -1704,6 +1704,27 @@ class _BodyRequest:
         return self._body
 
 
+def _harness_is_acp_backed(harness: str | None) -> bool:
+    """Whether *harness* drives its agent over ACP.
+
+    Reads the declared capability record rather than matching harness names, so
+    the builtin ACP harnesses (``acp``, ``goose``, ``qwen``) and any community
+    ACP plugin are covered without editing a list here. ``acp:<slug>`` is
+    accepted too — the slug picks the configured agent, not the harness.
+
+    :param harness: A harness name, ``acp:<slug>``, or ``None``.
+    :returns: ``True`` when the harness is ACP-backed.
+    """
+    if not harness:
+        return False
+    from omnigent.harness_capabilities import IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
+
+    key = harness.split(":", 1)[0]
+    caps = harness_capabilities().get(canonicalize_harness(key) or key)
+    return caps is not None and caps.integration_mode is IntegrationMode.ACP_SUBPROCESS
+
+
 def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
@@ -8454,10 +8475,7 @@ def create_runner_app(
         # rather than 500-ing this endpoint on the ones that don't.
         _running_harness = getattr(process_manager, "running_harness", None)
         running = _running_harness(session_id) if _running_harness is not None else None
-        # ``grok`` is a builtin ACP harness driving the same AcpExecutor, so its
-        # model list flows through the same harness /model-options route.
-        _ACP_MODEL_HARNESSES = ("acp", "grok")
-        if harness in _ACP_MODEL_HARNESSES or running in _ACP_MODEL_HARNESSES:
+        if _harness_is_acp_backed(harness) or _harness_is_acp_backed(running):
             # ACP agents own their model list (session/new SessionModelState);
             # ask the running harness subprocess. No live harness yet (no turn
             # run) -> empty, so the picker simply shows nothing until it loads.

@@ -748,7 +748,7 @@ async def _discover(
 
 async def _watch_for_rotation(
     *,
-    state: "_ReaderState",
+    state: _ReaderState,
     bound_cascade_id: str,
     interval_s: float,
     skip_cascade_ids: frozenset[str],
@@ -1231,8 +1231,7 @@ async def _poll_loop(
             # the cascade's current port before the next poll. A failed
             # re-resolution just keeps the old port and retries.
             _logger.warning(
-                "agy RPC reader poll hit a dead port; re-resolving: "
-                "cascade=%s port=%s error=%r",
+                "agy RPC reader poll hit a dead port; re-resolving: cascade=%s port=%s error=%r",
                 cascade_id,
                 port,
                 exc,

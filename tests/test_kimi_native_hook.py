@@ -199,7 +199,7 @@ def test_permission_request_elicitation_id_is_stable_per_tool_call(
 
     def _capture(url: object, headers: object, body: dict[str, object]) -> None:
         ids.append(body["_omnigent_elicitation_id"])
-        return None
+        return
 
     monkeypatch.setattr(kimi_native_hook, "_request_web_approval", _capture)
     _capture_injection(monkeypatch)
