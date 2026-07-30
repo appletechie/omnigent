@@ -170,7 +170,7 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
 # binary (uv fails with "Git executable not found"). --no-deps because the
 # plugin depends on an unpinned `omnigent` that would otherwise pull core from
 # PyPI over this image's own editable install.
-ARG OMNIGENT_DROID_REF=30854927816abfa4e0c9adef23115773fa39eef3
+ARG OMNIGENT_DROID_REF=79365e4d44358aae33c4f684f61b1974f1fe8b6d
 RUN uv pip install --no-cache-dir --no-deps \
         "omnigent-droid @ https://github.com/appletechie/omnigent-droid/archive/${OMNIGENT_DROID_REF}.tar.gz"
 
