@@ -6427,9 +6427,12 @@ function useResolvedComposerModel(
   // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
   // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
   // there it IS the applied model — but only once this session's catalog vouches
-  // for it (see `sessionStickyModel`).
+  // for it (see `sessionStickyModel`). ACP joins the no-sticky group for the same
+  // reason: the agent owns its model, so a session with no override has no
+  // Omnigent-visible model and the sticky would label it with a pick carried over
+  // from an unrelated session.
   const nonNativeModel =
-    modelPickerKind === null
+    modelPickerKind === null || modelPickerKind === "acp"
       ? (sessionModelOverride ?? llmModel)
       : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
