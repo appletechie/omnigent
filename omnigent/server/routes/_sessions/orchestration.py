@@ -7219,32 +7219,51 @@ async def _resolve_native_smart_routing(
     return native_agent.agent_name, model, verdict, None
 
 
-def _is_acp_harness_override(harness_override: str) -> bool:
-    """Whether *harness_override* selects an ACP-backed session.
+def _is_acp_harness_override(harness: str | None) -> bool:
+    """Whether *harness* drives its agent over ACP.
 
-    Covers every spelling the override can be stored as:
+    Reads the declared capability record rather than matching names, so the
+    builtin ACP harnesses (``acp``, ``goose``, ``qwen``) and any community ACP
+    plugin are covered without editing a list here. Both spellings the override
+    can be stored as are accepted: the concrete ``acp:<slug>`` a picker sends,
+    and the bare ``acp`` it canonicalizes to when the slug is folded away —
+    matching only the former made this dead code wherever the slug did not
+    survive validation.
 
-    - the concrete ``acp:<slug>`` a picker sends,
-    - the bare ``acp`` it canonicalizes to when the slug is folded away
-      (matching only the former would make this dead code wherever the slug
-      does not survive validation),
-    - a builtin ACP CLI harness id or alias, e.g. ``grok`` / ``grok-build``.
-
-    The builtin ids are read from :data:`ACP_CLI_HARNESSES` rather than listed
-    here, so a harness added to that catalog is recognized without a second
-    edit in this module.
-
-    :param harness_override: The session's stored harness override.
-    :returns: ``True`` for an ACP-backed session.
+    :param harness: A harness name, ``acp:<slug>``, or ``None``.
+    :returns: ``True`` for an ACP-backed harness.
     """
-    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    if not harness:
+        return False
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_capabilities import IntegrationMode
+    from omnigent.harness_plugins import harness_capabilities
 
-    if harness_override == "acp" or harness_override.startswith("acp:"):
-        return True
-    return any(
-        harness_override == key or harness_override in row.aliases
-        for key, row in ACP_CLI_HARNESSES.items()
-    )
+    key = harness.split(":", 1)[0]
+    caps = harness_capabilities().get(canonicalize_harness(key) or key)
+    return caps is not None and caps.integration_mode is IntegrationMode.ACP_SUBPROCESS
+
+
+async def _agent_declared_harness(conv: Conversation, agent_store: AgentStore) -> str | None:
+    """Return the harness the session's agent declares, best-effort.
+
+    Used only to decide a presentation label, so a spec that cannot be loaded
+    (no runtime, missing bundle, unparsable spec) yields ``None`` rather than
+    failing the create — the session still works, it just renders without the
+    ACP model picker.
+
+    :param conv: The freshly created conversation.
+    :param agent_store: Store the agent's bundle is loaded from.
+    :returns: The declared harness, or ``None``.
+    """
+    try:
+        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    except Exception:  # noqa: BLE001 — labelling must never fail session create
+        return None
+    config = getattr(getattr(spec, "executor", None), "config", None)
+    if not isinstance(config, dict):
+        return None
+    return str(config.get("harness") or "") or None
 
 
 async def _create_session_from_existing_agent(
@@ -7760,12 +7779,14 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv
-    elif conv.harness_override and _is_acp_harness_override(conv.harness_override):
-        # ACP-backed session (bare ``acp``, ``acp:<slug>``, or a builtin ACP CLI
-        # harness like ``grok``): tag it so the web model picker and the
-        # model-options fetch recognize it — ACP agents own their model list
-        # (SessionModelState) but have no native-agent registration to carry the
-        # wrapper label.
+    elif _is_acp_harness_override(
+        conv.harness_override or await _agent_declared_harness(conv, agent_store)
+    ):
+        # ACP-backed session, either picked as an override (``acp:<slug>``) or
+        # declared by the agent itself (``harness: droid``): tag it so the web
+        # model picker and the model-options fetch recognize it — ACP agents own
+        # their model list (SessionModelState) but have no native-agent
+        # registration to carry the wrapper label.
         #
         # Ordered BEFORE the REPL-terminal arm below because ACP is a non-native
         # harness: that arm matches every host-bound top-level ACP session, and
