@@ -162,6 +162,16 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
         uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
     fi
 
+# Community harness plugins. Registered via the omnigent.community.harness entry
+# point, so the server's valid_harnesses() accepts their specs — without this a
+# bundle declaring `harness: droid` is rejected at spec-parse. Pinned to a commit
+# so an image rebuild can't silently pick up a different plugin revision.
+# --no-deps: the plugin depends on an unpinned `omnigent`, which would otherwise
+# pull core from PyPI over this image's own editable install.
+ARG OMNIGENT_DROID_REF=7ea9b8f66b5872ea407a1a84ce7036b458d479b3
+RUN uv pip install --no-cache-dir --no-deps \
+        "omnigent-droid @ git+https://github.com/appletechie/omnigent-droid@${OMNIGENT_DROID_REF}"
+
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
 # image; contributes no layers of its own.
