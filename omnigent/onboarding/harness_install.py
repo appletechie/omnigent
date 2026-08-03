@@ -127,12 +127,6 @@ OPENCODE_KEY = "opencode"
 # ``install_hint``, not a ``package``.
 GOOSE_KEY = "goose"
 
-# Grok Build (xAI's ``grok`` CLI) is a builtin ACP harness. It ships via a curl
-# installer (not npm) and authenticates through its own ``grok login`` (xAI
-# OAuth, device-code capable) or ``XAI_API_KEY`` — no Omnigent-managed
-# credential. Readiness gates on the ``grok`` binary being on PATH.
-GROK_KEY = "grok"
-
 # Copilot runs in-process via the ``github-copilot-sdk`` package, which bundles
 # the Copilot CLI binary it drives — so, like cursor, there is no separately
 # installed CLI to gate on; readiness is whether a GitHub token resolves (see
@@ -277,14 +271,6 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint="brew install block-goose-cli",
         min_version=_GOOSE_MIN_VERSION,
     ),
-    GROK_KEY: HarnessInstallSpec(
-        "Grok Build",
-        "grok",
-        package=None,
-        login_args=("login", "--device-auth"),
-        install_hint="curl -fsSL https://x.ai/cli/install.sh | bash",
-        auth_hint="run `grok login --device-auth` (xAI OAuth) or set XAI_API_KEY",
-    ),
     HERMES_KEY: HarnessInstallSpec(
         "Hermes",
         "hermes",
@@ -337,10 +323,6 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # Headless Goose (``harness: goose``, drives ``goose acp``) wraps the same
     # ``goose`` CLI as the native TUI, so it gates on the same binary.
     GOOSE_KEY: GOOSE_KEY,
-    # Grok Build (``harness: grok``, alias ``grok-build``) drives ``grok agent
-    # stdio`` — gate on the ``grok`` binary.
-    GROK_KEY: GROK_KEY,
-    "grok-build": GROK_KEY,
     # Native Kimi TUI harness — same binary gate as the bare ``kimi`` surface.
     "kimi-native": KIMI_KEY,
     "native-kimi": KIMI_KEY,

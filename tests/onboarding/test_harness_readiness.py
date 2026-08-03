@@ -346,9 +346,6 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
-        # Grok Build (xAI) first-class ACP harness + alias; gates on the grok CLI.
-        "grok",
-        "grok-build",
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
         # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
         "acp",

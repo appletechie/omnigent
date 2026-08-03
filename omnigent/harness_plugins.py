@@ -570,19 +570,6 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
-    # Grok Build (xAI) — a builtin ACP harness driving ``grok agent stdio`` via
-    # the same generic AcpExecutor; same profile as the generic acp harness.
-    "grok": _C(
-        _IM.ACP_SUBPROCESS,
-        _EL.SSE_PERMISSION,
-        _RS.COLD_ONLY,
-        _EF.NONE,
-        _MF.MULTI,
-        _AU.OWN_AUTH,
-        subagents=False,
-        interrupt=True,
-        streaming=True,
-    ),
     "goose": _C(
         _IM.ACP_SUBPROCESS,
         _EL.SSE_PERMISSION,
@@ -678,7 +665,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "cursor-native",
             "goose",
             "goose-native",
-            "grok",
             "hermes",
             "hermes-native",
             "kimi",
@@ -711,7 +697,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "cursor-native": "omnigent.inner.cursor_native_harness",
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
-        "grok": "omnigent.inner.grok_harness",
         "hermes": "omnigent.inner.hermes_harness",
         "hermes-native": "omnigent.inner.hermes_native_harness",
         "kimi": "omnigent.inner.kimi_harness",
@@ -730,7 +715,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "claude": "claude-sdk",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
-        "grok-build": "grok",
         "kimi-code": "kimi",
         "native-antigravity": "antigravity-native",
         "native-goose": "goose-native",
@@ -826,7 +810,6 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
-        "grok": "Grok Build",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
