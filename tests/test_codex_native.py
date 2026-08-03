@@ -28,6 +28,16 @@ from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.spec import load
 
 
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
+
+
 def _write_codex_auth(path: Path, payload: object) -> None:
     """Write a test Codex auth.json payload."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,6 +432,14 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         codex_native_app_server.preload_codex_thread_for_resume(
             "ws://127.0.0.1:1234",
             "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            terminal_launch_args=[
+                "-c",
+                'default_permissions=":danger-full-access"',
+                "-c",
+                'approval_policy="never"',
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
         )
     )
 
@@ -432,10 +450,52 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
             {
                 "threadId": "019e96aa-0be2-7343-8d3b-6f914d60936b",
                 "excludeTurns": True,
+                "permissions": ":danger-full-access",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "auto_review",
             },
         )
     ]
     assert fake_client.closed is True
+
+
+def test_codex_resume_permission_params_parse_legacy_flags() -> None:
+    """Legacy approval and sandbox flags become preload overrides."""
+    assert codex_native_app_server._codex_resume_permission_params(
+        ["-a", "on-failure", "-s=read-only"]
+    ) == {
+        "approvalPolicy": "on-failure",
+        "sandbox": "read-only",
+    }
+
+
+def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> None:
+    """An incomplete stored Full Access profile resumes as the matching preset."""
+    args = [
+        "-c",
+        'default_permissions=":danger-full-access"',
+        "-c",
+        'approvals_reviewer="user"',
+    ]
+
+    assert codex_native_app_server._codex_resume_permission_params(args) == {
+        "permissions": ":danger-full-access",
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=tuple(args),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+    ) == [
+        *args,
+        "-c",
+        'approval_policy="never"',
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
+    ]
 
 
 def _started_event(turn_id: str) -> dict[str, Any]:
@@ -791,7 +851,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             None,
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "--remote",
@@ -804,7 +864,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             "thread_host",
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "resume",
@@ -840,7 +900,7 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
             thread_id=thread_id,
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 'model_provider="omnigent_databricks"',
             ),
         )
@@ -996,6 +1056,47 @@ def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
         )
         == expected
     )
+
+
+def test_build_codex_remote_args_bypass_hook_trust_prepends_flag() -> None:
+    """``bypass_hook_trust=True`` prepends ``--dangerously-bypass-hook-trust``.
+
+    Runner-owned headless sessions pass this flag so the TUI skips the
+    interactive "Hooks need review" prompt that can never be answered without
+    a live terminal user.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "--remote" in args
+    assert "ws://127.0.0.1:9876" in args
+
+
+def test_build_codex_remote_args_bypass_hook_trust_with_resume() -> None:
+    """``bypass_hook_trust=True`` flag precedes the ``resume`` subcommand."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id="thread-abc",
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "resume" in args
+    assert args.index("--dangerously-bypass-hook-trust") < args.index("resume")
+
+
+def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
+    """``bypass_hook_trust`` defaults to ``False``; flag is absent."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    assert "--dangerously-bypass-hook-trust" not in args
 
 
 def test_codex_app_server_client_uses_codex_remote_handshake(
@@ -9870,6 +9971,33 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
     assert len(post_items) == 1
 
 
+def test_codex_event_msg_record_ignores_non_list_content() -> None:
+    """Malformed message content is skipped as it was before type narrowing."""
+    assert (
+        codex_native._codex_event_msg_record_for_message(
+            {"type": "message", "role": "user", "content": "not-a-list"},
+            timestamp="2026-08-02T00:00:00.000Z",
+        )
+        is None
+    )
+
+
+def test_codex_event_msg_record_reports_non_string_text_cleanly() -> None:
+    """Malformed block text produces a user-facing CLI error."""
+    with pytest.raises(
+        click.ClickException,
+        match="Codex message content text must be a string",
+    ):
+        codex_native._codex_event_msg_record_for_message(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": 42}],
+            },
+            timestamp="2026-08-02T00:00:00.000Z",
+        )
+
+
 def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> None:
     """Sessions without compaction produce no Compacted rollout record."""
     items: list[dict[str, Any]] = [
@@ -9891,6 +10019,40 @@ def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> Non
     )
     types = [r["type"] for r in records]
     assert "compacted" not in types
+
+
+@pytest.mark.parametrize(
+    "terminal_launch_args",
+    [
+        ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+        ["-c", 'default_permissions=":danger-full-access"'],
+    ],
+)
+def test_rollout_records_use_terminal_launch_permission_args(
+    terminal_launch_args: list[str],
+) -> None:
+    """Cold-resume turn_context preserves the persisted Codex permission mode."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "response_id": "resp_1",
+            }
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+        terminal_launch_args=terminal_launch_args,
+    )
+
+    turn_context = next(r for r in records if r["type"] == "turn_context")["payload"]
+    assert turn_context["approval_policy"] == "never"
+    assert turn_context["sandbox_policy"] == {"type": "danger-full-access"}
 
 
 # --- #2745: routing summary surfaced in the startup-timeout error ---

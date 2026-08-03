@@ -40,6 +40,7 @@ from omnigent.onboarding.ucode_setup import (
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
     from omnigent.onboarding.ambient import DetectedProvider
+    from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
 # _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
@@ -52,22 +53,26 @@ if TYPE_CHECKING:
 _CLI_LOGIN_BRAND: dict[str, str] = {"claude": "Claude", "codex": "ChatGPT"}
 
 
-def _load_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_global_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_global_config(*a, **k)
+    return _cli._load_global_config()
 
 
-def _save_global_config(*a, **k):  # type: ignore[no-untyped-def]
+def _save_global_config(  # type: ignore[explicit-any]
+    settings: collections.abc.Mapping[str, Any],
+    unset_keys: tuple[str, ...] = (),
+    deep_merge_keys: tuple[str, ...] = (),
+) -> None:
     import omnigent.cli as _cli
 
-    return _cli._save_global_config(*a, **k)
+    _cli._save_global_config(settings, unset_keys, deep_merge_keys)
 
 
-def _load_effective_config(*a, **k):  # type: ignore[no-untyped-def]
+def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     import omnigent.cli as _cli
 
-    return _cli._load_effective_config(*a, **k)
+    return _cli._load_effective_config()
 
 
 # Node version hint shared by the preflight problem messages and surfaced
@@ -172,7 +177,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     import signal
     import tempfile
 
-    from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
     from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
 
     original_cfg = Path.home() / ".databrickscfg"
@@ -198,7 +203,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     if original_cfg.exists():
         orig_cfg.read(original_cfg)
     cfg = configparser.ConfigParser()
-    for spec in DEFAULT_PROFILES:
+    for spec in internal_beta.DEFAULT_PROFILES:
         if orig_cfg.has_section(spec.name):
             cfg[spec.name] = dict(orig_cfg[spec.name])
 
@@ -240,7 +245,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         orig_cfg = configparser.ConfigParser()
         if original_cfg.exists():
             orig_cfg.read(original_cfg)
-        for spec in DEFAULT_PROFILES:
+        for spec in internal_beta.DEFAULT_PROFILES:
             if tmp_cfg.has_section(spec.name):
                 orig_cfg[spec.name] = dict(tmp_cfg[spec.name])
         write_tmp = original_cfg.with_suffix(".tmp")
@@ -727,8 +732,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # releases (e.g. a brand-new claude-sonnet-4-6 won't be listed yet), so
         # a fixed picker would block the user from a model they can actually
         # use. Pre-fill the canonical default and let the user type ANY model
-        # id. Blank → the default (or no pin when unknown). Always persisting
-        # a pin keeps a later re-add from silently dropping ``models.default``.
+        # id. Blank accepts a known catalog default; without one, the prompt
+        # requires an explicit model id.
         from omnigent.onboarding.providers import default_chat_model
 
         catalog_default = default_chat_model(provider)
@@ -859,9 +864,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             wire_api = RESPONSES_WIRE_API if wire_choice == 0 else CHAT_WIRE_API
         # Default model per served surface. A gateway has NO catalog default,
         # so without a pin routing would fall back to a vendor model the
-        # gateway can't serve. The OpenAI surface pre-fills a broadly-served
-        # OSS default (moonshotai/kimi-k2.6, via the openrouter pin); the
-        # user can type any gateway model id.
+        # gateway can't serve. The OpenAI surface pre-fills the catalog's
+        # preferred Kimi-family model; if none is advertised, the user must
+        # type a gateway model id explicitly.
         from omnigent.onboarding.providers import default_chat_model
 
         models: dict[str, str] = {}
@@ -904,8 +909,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # usually not enabled on a Bedrock account, so pin an explicit id.
         default_model = (
             prompt_text(
-                "Default model (Bedrock inference-profile id, e.g. "
-                "us.anthropic.claude-opus-4-5-20251101-v1:0)"
+                "Default model (Bedrock inference-profile id or ARN; e.g. "
+                "us.vendor.model-family-YYYYMMDD-v1:0)"
             ).strip()
             or None
         )
@@ -1670,9 +1675,10 @@ def _manage_cursor_harness() -> None:
         from omnigent._platform import resolve_cli_binary
 
         cli_installed = harness_cli_installed(CURSOR_KEY)
+        install_spec = harness_install_spec(CURSOR_KEY)
         if cli_installed:
             cli_status = "logged in" if harness_cli_logged_in(CURSOR_KEY) else "needs login"
-        elif resolve_cli_binary(harness_install_spec(CURSOR_KEY).binary) is not None:
+        elif install_spec is not None and resolve_cli_binary(install_spec.binary) is not None:
             cli_status = "needs upgrade"
         else:
             cli_status = "not installed"
@@ -2236,6 +2242,111 @@ def _add_acp_agent() -> None:
     entries.append(AcpAgentEntry(slug=slugify(name), name=name, command=command, model=model))
     _save_global_config(acp_agents_settings(entries))
     console.print(f"  ✓ Added {name}")
+
+
+def _display_openclaw_path(path: Path) -> str:
+    """Return a compact user-facing config path."""
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        return str(path)
+
+
+def _choose_openclaw_source() -> OpenClawDiscovery | None:
+    """Choose an auto-detected or user-provided OpenClaw/acpx config."""
+    from omnigent.onboarding.interactive import prompt_text, select
+    from omnigent.onboarding.openclaw_config import (
+        default_config_paths,
+        openclaw_agents_to_acp_entries,
+        read_openclaw_config,
+    )
+
+    detected: list[OpenClawDiscovery] = []
+    options: list[str] = []
+    sources: tuple[SourceKind, SourceKind] = ("acpx", "openclaw")
+    for source, path in zip(sources, default_config_paths(), strict=True):
+        try:
+            exists = path.exists()
+        except OSError:
+            exists = True
+        if not exists:
+            continue
+        discovery = read_openclaw_config(path, source=source)
+        detected.append(discovery)
+        count = len(openclaw_agents_to_acp_entries(discovery.agents))
+        if count:
+            noun = "agent" if count == 1 else "agents"
+            hint = f"{count} {noun}"
+        elif discovery.errors:
+            hint = "unreadable"
+        else:
+            hint = "no agents"
+        options.append(f"{_display_openclaw_path(path)}  ·  {hint}")
+
+    custom_index = len(options)
+    options.extend(["Choose another file…", "← Back"])
+    choice = select("Import agents from OpenClaw", options, clear_on_exit=True)
+    if choice < 0 or choice == len(options) - 1:
+        return None
+    if choice < custom_index:
+        return detected[choice]
+
+    entered = prompt_text("OpenClaw/acpx config path").strip()
+    path = Path(os.path.expandvars(entered)).expanduser()
+    return read_openclaw_config(path)
+
+
+def _import_openclaw_agents() -> None:
+    """Import selected OpenClaw/acpx agents into the generic ``acp:`` block."""
+    from rich.markup import escape
+
+    from omnigent.onboarding.acp_auth import acp_agents_settings, command_binary_on_path
+    from omnigent.onboarding.interactive import console
+    from omnigent.onboarding.openclaw_config import (
+        merge_imported_acp_entries,
+        openclaw_agents_to_acp_entries,
+    )
+
+    while True:
+        discovery = _choose_openclaw_source()
+        if discovery is None:
+            return
+        if discovery.errors:
+            console.print("\n  [yellow]Some OpenClaw/acpx entries could not be read:[/yellow]")
+            for error in discovery.errors:
+                console.print(f"    • {escape(str(error.path))}")
+                console.print(f"      {escape(error.message)}")
+
+        imported = openclaw_agents_to_acp_entries(discovery.agents)
+        merged, added = merge_imported_acp_entries(imported)
+        if not imported:
+            console.print("  [yellow]No OpenClaw/acpx agents found in that file.[/yellow]")
+            continue
+        if not added:
+            console.print("  ✓ Those OpenClaw/acpx agents are already imported.")
+            continue
+
+        console.print("\n  [bold]OpenClaw/acpx agents found[/bold]")
+        for entry in added:
+            suffix = (
+                ""
+                if command_binary_on_path(entry.command)
+                else " [yellow](binary not found on PATH)[/yellow]"
+            )
+            console.print(
+                f"    • [bold]{escape(entry.name)}[/bold] → "
+                f"[dim]{escape(entry.command)}[/dim]{suffix}"
+            )
+        console.print("  [dim]Omnigent stores only these launch commands, not credentials.[/dim]")
+
+        if not click.confirm("Import coding agents from OpenClaw?", default=True):
+            console.print("  [yellow]Skipped OpenClaw import.[/yellow]")
+            return
+
+        _save_global_config(acp_agents_settings(merged))
+        noun = "agent" if len(added) == 1 else "agents"
+        console.print(f"  ✓ Imported {len(added)} OpenClaw/acpx {noun}.")
+        return
 
 
 def _manage_acp_agent(slug: str) -> None:
@@ -3053,7 +3164,7 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     if current is not None:
         clear_index = len(options)
         options.append("Clear default (use OpenCode's own default)")
-    default = models.index(current) if current in models else 0
+    default = models.index(current) if current is not None and current in models else 0
     # Even filtered to reachable providers the list can exceed the screen, so
     # bound the picker to a scrolling viewport sized to the terminal (leaving
     # room for the title / status / footer / "N more" markers).
@@ -3309,9 +3420,10 @@ def _run_configure_harnesses_interactive() -> None:
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row
-    # (``_ACP_AGENT_PREFIX + slug`` → per-agent remove drill-in); a single
-    # ``_ACP_ADD`` row jumps straight into the add flow. Not a provider family —
-    # each ACP agent owns its own auth.
+    # (``_ACP_AGENT_PREFIX + slug`` → per-agent remove drill-in); import/add rows
+    # jump straight into those flows. Not a provider family — each ACP agent owns
+    # its own auth.
+    _ACP_IMPORT = "\x00acp-import-openclaw"
     _ACP_ADD = "\x00acp-add"
     _ACP_AGENT_PREFIX = "\x00acp-agent:"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
@@ -3661,8 +3773,15 @@ def _run_configure_harnesses_interactive() -> None:
         # harnesses, followed by an "Add" row that jumps straight into the add
         # flow. Not gated on a binary — each agent owns its own install.
         from omnigent.onboarding.acp_auth import acp_config_summary
+        from omnigent.onboarding.openclaw_config import (
+            discover_openclaw_agents,
+            openclaw_agents_to_acp_entries,
+        )
 
-        acp_summary = acp_config_summary()
+        try:
+            acp_summary = acp_config_summary()
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid acp.agents configuration: {exc}") from exc
         for agent in acp_summary.agents:
             rows.append(
                 (
@@ -3673,6 +3792,23 @@ def _run_configure_harnesses_interactive() -> None:
                     "Select to remove this ACP agent.",
                 )
             )
+        openclaw_discovery = discover_openclaw_agents()
+        openclaw_imported = openclaw_agents_to_acp_entries(openclaw_discovery.agents)
+        count = len(openclaw_imported)
+        if count:
+            noun = "agent" if count == 1 else "agents"
+            import_status = f"{count} {noun} found automatically"
+        else:
+            import_status = ""
+        rows.append(
+            (
+                _ACP_IMPORT,
+                "Import from OpenClaw",
+                import_status,
+                "action",
+                "Choose a detected OpenClaw/acpx config or enter another path.",
+            )
+        )
         rows.append(
             (
                 _ACP_ADD,
@@ -3698,18 +3834,19 @@ def _run_configure_harnesses_interactive() -> None:
         # _render_menu prefixes selected rows with ``"    ❯  "`` (7 cells).
         # Cap the status text from the actual terminal width so verbose status
         # rows (e.g. OpenCode's provider summary) do not wrap in the compact
-        # single-line overview.
-        max_status_width = max(8, min(30, term_width - 7 - name_col - len("✓ ")))
+        # single-line overview. "Import from OpenClaw" can leave fewer than
+        # eight cells at the 40-column minimum, so the floor follows available space.
+        max_status_width = max(1, min(30, term_width - 7 - name_col - len("✓ ")))
         options: list[str] = []
         selectable: list[bool] = []
         row_target: list[str | None] = []
         descriptions: list[str] = []
-        for target, name, status_text, kind, desc in harness_rows:
+        for row_key, name, status_text, kind, desc in harness_rows:
             status_text = _truncate_cells(status_text, max_status_width)
             glyph, color = status_styles[kind]
             options.append(f"{name.ljust(name_col)}[{color}]{glyph} {escape(status_text)}[/]")
             selectable.append(True)
-            row_target.append(target)
+            row_target.append(row_key)
             descriptions.append(desc)
         options.append("Quit")
         selectable.append(True)
@@ -3725,30 +3862,32 @@ def _run_configure_harnesses_interactive() -> None:
         )
         if idx < 0:  # Esc / q — exit
             return
-        target = row_target[idx]
-        if target == CURSOR_KEY:
+        selected_target = row_target[idx]
+        if selected_target == CURSOR_KEY:
             _manage_cursor_harness()
-        elif target == COPILOT_KEY:
+        elif selected_target == COPILOT_KEY:
             _manage_copilot_harness()
-        elif target in families:
-            _manage_harness_providers(target)
-        elif target == _ANTIGRAVITY:
+        elif isinstance(selected_target, str) and selected_target in families:
+            _manage_harness_providers(selected_target)
+        elif selected_target == _ANTIGRAVITY:
             _manage_antigravity_harness()
-        elif target == _QWEN:
+        elif selected_target == _QWEN:
             _manage_qwen_harness()
-        elif target == _OPENCODE:
+        elif selected_target == _OPENCODE:
             _manage_opencode_harness()
-        elif target == _GOOSE:
+        elif selected_target == _GOOSE:
             _manage_goose_harness()
-        elif target == _ACP_ADD:
+        elif selected_target == _ACP_IMPORT:
+            _import_openclaw_agents()
+        elif selected_target == _ACP_ADD:
             _add_acp_agent()
-        elif isinstance(target, str) and target.startswith(_ACP_AGENT_PREFIX):
-            _manage_acp_agent(target[len(_ACP_AGENT_PREFIX) :])
-        elif target == _HERMES:
+        elif isinstance(selected_target, str) and selected_target.startswith(_ACP_AGENT_PREFIX):
+            _manage_acp_agent(selected_target[len(_ACP_AGENT_PREFIX) :])
+        elif selected_target == _HERMES:
             _manage_hermes_harness()
-        elif target == _KIRO:
+        elif selected_target == _KIRO:
             _manage_kiro_harness()
-        elif target == _KIMI:
+        elif selected_target == _KIMI:
             _manage_kimi_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return
