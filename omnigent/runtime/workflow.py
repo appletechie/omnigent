@@ -1514,6 +1514,57 @@ def _build_goose_spawn_env(
     return env
 
 
+def _build_acp_cli_spawn_env(
+    spec: AgentSpec,
+    *,
+    harness: str,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """Build the generic-ACP env for one builtin ACP CLI harness (catalog row).
+
+    Rows in :data:`omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES` all run the
+    shared ``omnigent/inner/acp_harness.py`` wrap; this maps a row + spec to
+    the ``HARNESS_ACP_*`` vars it reads. Like goose/acp, a vendor ACP CLI owns
+    its own auth and model, so no provider/gateway credential and no model var
+    is wired. The binary resolves via the ``OMNIGENT_<NAME>_PATH`` env
+    override, then the config ``harness.<name>.command`` path, then PATH plus
+    the common global install dirs.
+
+    :param spec: The agent spec.
+    :param harness: The catalog row key, e.g. ``"grok"``.
+    :param workdir: Accepted for signature parity with the other builders; the
+        ACP wrap consumes no bundle dir.
+    :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harness_startup_config import (
+        config_harness_path_override,
+        resolve_harness_path,
+    )
+
+    row = ACP_CLI_HARNESSES[harness]
+    executable = (
+        resolve_harness_path(harness)
+        or config_harness_path_override(harness, load_config())
+        or resolve_cli_binary(row.binary)
+        or row.binary
+    )
+    env = {
+        "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
+        "HARNESS_ACP_NAME": row.label,
+    }
+    # Session workspace (selected working folder). ``None`` lets the wrap fall
+    # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
+    if cwd is not None:
+        env["HARNESS_ACP_CWD"] = str(cwd)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    return env
+
+
 def _build_acp_spawn_env(
     spec: AgentSpec,
     *,

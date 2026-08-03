@@ -40,6 +40,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -8719,6 +8720,7 @@ def _build_spawn_env_from_spec(
             )
     try:
         from omnigent.runtime.workflow import (
+            _build_acp_cli_spawn_env,
             _build_acp_spawn_env,
             _build_antigravity_spawn_env,
             _build_claude_sdk_spawn_env,
@@ -8754,6 +8756,12 @@ def _build_spawn_env_from_spec(
             env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+        elif harness in ACP_CLI_HARNESSES:
+            # Builtin ACP CLI harnesses (one catalog row each) share a single
+            # builder; the row supplies the command, label, and install info.
+            env = _build_acp_cli_spawn_env(
+                effective_spec, harness=harness, cwd=cwd, workdir=workdir
+            )
         else:
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:
