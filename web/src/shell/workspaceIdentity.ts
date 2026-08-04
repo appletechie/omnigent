@@ -39,6 +39,10 @@ function basename(path: string): string {
  * @param git - Git identity from the runner's environment metadata, or null
  *   when the workspace isn't a repo (and undefined while the probe is in
  *   flight or the runner is unreachable).
+ * @param envRoot - The environment's reported root. Preferred over
+ *   ``workspacePath`` outside a repo: the two disagree when the runner starts
+ *   the session somewhere other than its bound workspace, and the root is
+ *   where the agent actually works.
  * @param workspacePath - The session's bound workspace directory.
  * @param sessionBranch - ``Session.gitBranch`` — set only when the server
  *   created a worktree for this session, so it implies one.
@@ -46,6 +50,7 @@ function basename(path: string): string {
  */
 export function deriveWorkspaceIdentity(
   git: WorkspaceGitIdentity | null | undefined,
+  envRoot: string | null | undefined,
   workspacePath: string | null | undefined,
   sessionBranch: string | null | undefined,
 ): WorkspaceIdentity | null {
@@ -60,7 +65,8 @@ export function deriveWorkspaceIdentity(
       isRepo: true,
     };
   }
-  const name = workspacePath?.trim() ? basename(workspacePath) : "";
+  const path = envRoot?.trim() ? envRoot : workspacePath;
+  const name = path?.trim() ? basename(path) : "";
   if (name === "") return null;
   return {
     name,

@@ -512,10 +512,16 @@ export function AppShell() {
     () =>
       deriveWorkspaceIdentity(
         environmentQuery.data?.git,
+        environmentQuery.data?.root,
         activeSession?.workspace,
         activeSession?.gitBranch,
       ),
-    [environmentQuery.data?.git, activeSession?.workspace, activeSession?.gitBranch],
+    [
+      environmentQuery.data?.git,
+      environmentQuery.data?.root,
+      activeSession?.workspace,
+      activeSession?.gitBranch,
+    ],
   );
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount

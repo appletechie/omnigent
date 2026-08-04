@@ -9,6 +9,7 @@ describe("deriveWorkspaceIdentity", () => {
       deriveWorkspaceIdentity(
         { repo: "omnigent", ref: "feat/login", detached: false, worktree: true },
         "/Users/alice/omnigent-worktrees/feat-login",
+        "/Users/alice/omnigent-worktrees/feat-login",
         null,
       ),
     ).toEqual({
@@ -25,6 +26,7 @@ describe("deriveWorkspaceIdentity", () => {
       deriveWorkspaceIdentity(
         { repo: "omnigent", ref: "a1b2c3d", detached: true, worktree: false },
         "/Users/alice/omnigent",
+        "/Users/alice/omnigent",
         null,
       ),
     ).toMatchObject({ ref: "a1b2c3d", detached: true });
@@ -37,13 +39,14 @@ describe("deriveWorkspaceIdentity", () => {
       deriveWorkspaceIdentity(
         { repo: "omnigent", ref: null, detached: true, worktree: true },
         "/Users/alice/omnigent",
+        "/Users/alice/omnigent",
         "feat/login",
       ),
     ).toMatchObject({ ref: "feat/login", detached: false, worktree: true });
   });
 
   it("falls back to the workspace folder before the environment probe lands", () => {
-    expect(deriveWorkspaceIdentity(undefined, "/Users/alice/myrepo", null)).toEqual({
+    expect(deriveWorkspaceIdentity(undefined, null, "/Users/alice/myrepo", null)).toEqual({
       name: "myrepo",
       ref: null,
       detached: false,
@@ -55,22 +58,36 @@ describe("deriveWorkspaceIdentity", () => {
   it("treats a session branch as proof of a worktree in the fallback path", () => {
     // Session.gitBranch is only set for a server-created worktree.
     expect(
-      deriveWorkspaceIdentity(null, "/Users/alice/myrepo-worktrees/feat-login", "feat/login"),
+      deriveWorkspaceIdentity(
+        null,
+        "/Users/alice/myrepo-worktrees/feat-login",
+        "/Users/alice/myrepo-worktrees/feat-login",
+        "feat/login",
+      ),
     ).toMatchObject({ name: "feat-login", ref: "feat/login", worktree: true, isRepo: true });
   });
 
   it("tolerates trailing separators and Windows paths", () => {
-    expect(deriveWorkspaceIdentity(null, "/Users/alice/myrepo/", null)).toMatchObject({
+    expect(deriveWorkspaceIdentity(null, "/Users/alice/myrepo/", null, null)).toMatchObject({
       name: "myrepo",
     });
-    expect(deriveWorkspaceIdentity(null, "C:\\Users\\alice\\myrepo", null)).toMatchObject({
+    expect(deriveWorkspaceIdentity(null, "C:\\Users\\alice\\myrepo", null, null)).toMatchObject({
       name: "myrepo",
     });
   });
 
+  it("names the environment root, not a bound workspace the runner didn't use", () => {
+    // The runner starts sessions in its own workspace when one is configured,
+    // so the session's stored path can point somewhere else entirely. The
+    // header must name the directory the agent actually works in.
+    expect(
+      deriveWorkspaceIdentity(null, "/srv/runner/workspace", "/Users/alice/myrepo", null),
+    ).toMatchObject({ name: "workspace", isRepo: false });
+  });
+
   it("returns null when neither source knows where the session works", () => {
-    expect(deriveWorkspaceIdentity(null, null, null)).toBeNull();
-    expect(deriveWorkspaceIdentity(undefined, "   ", null)).toBeNull();
+    expect(deriveWorkspaceIdentity(null, null, null, null)).toBeNull();
+    expect(deriveWorkspaceIdentity(undefined, "   ", "   ", null)).toBeNull();
   });
 });
 
