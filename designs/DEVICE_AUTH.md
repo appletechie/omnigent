@@ -18,8 +18,8 @@
 > `set_grant_revocation_check`). Wired in `omnigent/server/app.py`,
 > **opt-in and default-off** via `OMNIGENT_DEVICE_GRANT_ENABLED` (the
 > `/oauth/*` routes are unmounted unless it is truthy), and then only in
-> **accounts** mode (OIDC delegates login to the IdP via the cli-ticket
-> flow and never mounts these routes).
+> **accounts** and **oidc** modes — the two that own a server-minted
+> session cookie. Header mode has no server-mintable identity.
 > Slack: `integrations/slack/src/omnigent_slack/oauth.py`,
 > `tokens.py` (Fernet-encrypted `oauth_tokens`), `auth_manager.py`, plus
 > the bearer/refresh wiring in `omnigent.py` (`ClientAuth`,
@@ -91,9 +91,11 @@ The device grant builds on existing server primitives:
 - **Bearer validation** — `UnifiedAuthProvider._check_cookie` accepts
   `Authorization: Bearer <jwt>` and validates the same claim shape
   (`auth.py`). Delegated access tokens validate through this path unchanged.
-- **Browser consent under accounts mode** — the `accounts` provider
-  establishes the browser identity via its session cookie; the consent page
-  runs behind it. (This is why the grant mounts in accounts mode only — see
+- **Browser consent** — both `accounts` and `oidc` establish the browser
+  identity through the same HS256 session cookie, and the consent page runs
+  behind it. Under OIDC the bounce hands off to the IdP, so *how* the user
+  proves themselves — password, Google, SAML — is never this module's
+  business. (Header mode mints no session, which is why it is excluded — see
   the mount restriction below.)
 - **Open-redirect hardening** — `_sanitize_return_to` (`routes/auth.py`) guards
   the post-login bounce back to the consent page.
@@ -184,10 +186,20 @@ approved it.
 
 Mounted in `app.py` only when **`OMNIGENT_DEVICE_GRANT_ENABLED` is truthy**
 (opt-in, **default-off** — the `/oauth/*` routes are absent otherwise), and
-then **only in `accounts` mode** (OIDC delegates login to the IdP via the
-cli-ticket flow and never mounts these routes; header mode has no
-server-mintable identity — see `create_device_auth_router`, which raises if
-constructed for any other source). The `device_grants` table is created
+then **only in `accounts` and `oidc` modes**. Header mode has no
+server-mintable identity — there is nothing to delegate from and no login to
+bounce a consenting browser through — see `create_device_auth_router`, which
+raises if constructed for any other source.
+
+**Forced re-authentication across the two modes.** The consent gate (session
+`iat` ≥ grant `created_at`) bounces with `reauth=1`, and each login path has
+to honour it in its own way. Accounts holds back the SPA's auto-redirect and
+demands a password. OIDC has no form to hold back, so `/auth/login` forwards
+`reauth=1` to the IdP as `prompt=login` (OIDC Core 3.1.2.1). Dropping that
+forwarding does not break the flow — the IdP satisfies the bounce from its own
+session and the callback mints a fresh `iat` that clears the gate — it just
+silently removes the deliberate-credential-entry property the gate exists for.
+Pinned by `tests/server/test_oidc_reauth_prompt.py`. The `device_grants` table is created
 unconditionally by the migration regardless of the flag; only the router
 mount is gated. This router **owns** `mint_delegated_token` and
 `DELEGATED_SCOPE`.
