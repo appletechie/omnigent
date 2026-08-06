@@ -60,6 +60,7 @@ import logging
 import os
 import secrets
 import time
+from urllib.parse import quote
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
@@ -456,7 +457,12 @@ def create_device_auth_router(
         """
         login_url = auth_provider.login_url or "/login"
         return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
-        query = f"return_to={html.escape(return_to, quote=True)}&reauth=1"
+        # Percent-encoded, not HTML-escaped: this is a URL query value, and
+        # `html.escape` leaves `?`, `=`, `#` and `+` untouched, so a user_code
+        # carrying one would truncate or corrupt the round-trip. `&` survives
+        # as `&amp;` today, which is why `reauth=1` still wins — an accident
+        # of the escaper, not a property worth depending on.
+        query = f"return_to={quote(return_to, safe='/')}&reauth=1"
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
     def _session_auth_time(request: Request) -> int | None:

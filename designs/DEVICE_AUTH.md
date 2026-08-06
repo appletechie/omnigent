@@ -38,6 +38,14 @@
 > (`app.py`: device auth is `oidc`/`accounts` only), so `start_login`
 > raises a clear error rather than firing a request the server would 404.
 >
+> **Note.** Mounting the grant under OIDC does not change either
+> first-party client: the CLI (`cli.py`) and Slack (`oauth.py`) still
+> probe the mode and still take the cli-ticket flow there. The OIDC
+> device-grant routes exist for *external* clients — ones that must hold a
+> scoped, revocable, refreshable credential rather than the server's own
+> session JWT, and that cannot be trusted with account-wide authority.
+> Migrating the first-party clients onto it is separate work.
+>
 > Tests: `tests/server/test_device_auth.py`, and the Slack
 > `test_oauth.py` / `test_tokens.py` / `test_client_auth.py` /
 > `test_auth_manager.py`.

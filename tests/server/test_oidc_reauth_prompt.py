@@ -131,19 +131,20 @@ def test_re_authentication_still_round_trips_the_return_to(oidc_client: TestClie
     Losing it would land the user on the dashboard after re-entering their
     password, with the pending grant abandoned and no way back to it.
     """
-    from urllib.parse import unquote
-
     import jwt
 
+    # Percent-encoded exactly as `_bounce_to_login` emits it. Decoding the
+    # stored value before asserting would have passed under either encoding
+    # and hidden whether the query survived at all.
     oidc_client.get(
-        "/auth/login?reauth=1&return_to=/oauth/device%3Fuser_code%3DK7M2-QP9X",
+        "/auth/login?reauth=1&return_to=%2Foauth%2Fdevice%3Fuser_code%3DK7M2-QP9X",
         follow_redirects=False,
     )
     cookie = oidc_client.cookies.get("ap_auth_state")
     assert cookie is not None
     claims = jwt.decode(cookie, _TEST_SECRET, algorithms=["HS256"])
 
-    assert unquote(claims["return_to"]) == "/oauth/device?user_code=K7M2-QP9X"
+    assert claims["return_to"] == "/oauth/device?user_code=K7M2-QP9X"
 
 
 # ── The consent page against a REAL OIDCConfig ────────────────────
@@ -199,6 +200,9 @@ def test_consent_page_renders_for_a_real_oidc_session_cookie(tmp_path: Path) -> 
         page = client.get(f"/oauth/device?user_code={user_code}", follow_redirects=False)
 
     assert bounced.status_code == 302, "an unproven session must not reach consent"
+    # `/auth/login`, not the accounts SPA's `/login` — the other half of
+    # `login_url`, which a `"/login" in location` substring cannot tell apart.
+    assert bounced.headers["location"].startswith("/auth/login?"), bounced.headers["location"]
     assert "reauth=1" in bounced.headers["location"]
 
     assert page.status_code == 200, f"consent bounced instead of rendering: {page.headers}"
