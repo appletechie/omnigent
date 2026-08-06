@@ -208,23 +208,48 @@ live IdP session, and the consent page cannot tell the two cases apart.
 
 **Requested, then verified.** `prompt=login` is only a request, so the bounce
 also sends `max_age=0`, which obliges a conforming IdP to report the moment it
-authenticated the user in the `auth_time` claim. `/auth/login` signs the bounce
-time into the state cookie as `reauth_at`, and `/auth/callback` refuses (403,
-no session minted) unless the returned `auth_time` postdates it. A missing
-`auth_time` is refused too: silence is indistinguishable from a reused session,
-and this gate is the only thing between a phished consent link and a delegated
-grant. Ordinary logins carry no `reauth_at` and are unaffected — most IdPs omit
-the claim, and requiring it everywhere would break every sign-in.
+authenticated the user in the `auth_time` claim. The callback compares that
+claim against the id_token's own `iat` — both the IdP's clock, so skew between
+the two servers cancels out and a session established minutes earlier fails the
+comparison regardless of whose clock is ahead. A missing `auth_time` fails too:
+silence is indistinguishable from a reused session.
 
-**Why GitHub is excluded.** `OIDCConfig.from_env` accepts GitHub as an `oidc`
-source, but points it at `https://github.com/login/oauth/authorize` — plain
-OAuth 2.0, which has no `prompt` parameter. `prompt=login` would be ignored,
-GitHub would reuse its session, and the callback's fresh `iat` would clear the
-gate. `unsupported_reason` therefore refuses the grant for that provider
-outright: a grant issued behind a gate that cannot hold is worse than no grant,
-because it looks protected. `app.py` logs the refusal so an operator who set
-`OMNIGENT_DEVICE_GRANT_ENABLED` is told why `/oauth/*` is absent instead of
-assuming the flag did not take. The `device_grants` table is created
+**The proof rides on the session, not on `iat`.** Gating consent on the session
+cookie's `iat` was bypassable without ever attacking the gate. `/auth/login` is
+a public GET accepting any same-origin `return_to`, so an attacker who starts a
+grant can send the victim `/auth/login?return_to=/oauth/device?user_code=…`
+with **no** `reauth=1` — no `reauth_at` is signed, nothing is demanded, the IdP
+satisfies it from its own session, and the resulting cookie carries an `iat` of
+*now* that clears the gate. The forced path was never entered.
+
+So a successful re-authentication is recorded on the session itself, as an
+`auth_time` claim (`mint_session_token`), written **only** where a credential
+was actually presented: an accounts password submit, or an IdP-attested
+re-authentication. Consent requires `auth_time ≥ grant.created_at`. A login
+that skipped the bounce carries no claim, so it bounces and is made to prove
+itself — the demand no longer depends on the attacker's link having asked for
+it. `reauth_at` remains, signed into the state cookie, as the marker that makes
+the callback *refuse* (403, no session minted) rather than merely decline to
+stamp the proof.
+
+An IdP that never emits `auth_time` cannot carry a device grant: consent
+bounces once, the forced callback 403s with a clear error, and the loop
+terminates rather than spinning.
+
+**Which providers qualify.** `unsupported_reason` **allowlists**
+`provider_type == "oidc"` rather than denying known-bad values. `from_env`
+yields only `github` or `oidc` today, so the two are equivalent right now — but
+the next OAuth 2.0 dialect modelled under the `oidc` source would otherwise be
+admitted by default, behind a gate that cannot hold for it. GitHub is the
+present example: `from_env` points it at
+`https://github.com/login/oauth/authorize`, which has no `prompt` parameter, no
+id_token and no `auth_time`, so there is no way to demand a re-authentication
+nor to detect that none happened.
+
+`app.py` logs every refusal, and computes it **before** the auth-router mount —
+that mount is gated on `login_url` being truthy, and header mode's is `None`,
+so an operator in the one mode where the grant can never work was previously
+the only one who never saw the explanation. The `device_grants` table is created
 unconditionally by the migration regardless of the flag; only the router
 mount is gated. This router **owns** `mint_delegated_token` and
 `DELEGATED_SCOPE`.

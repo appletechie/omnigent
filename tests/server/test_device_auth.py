@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -75,7 +75,7 @@ def test_router_factory_rejects_github_oauth(tmp_path: Path) -> None:
     from omnigent.server.routes.device_auth import create_device_auth_router
 
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
-    with pytest.raises(RuntimeError, match="GitHub OAuth"):
+    with pytest.raises(RuntimeError, match="not full OIDC"):
         create_device_auth_router(_oidc_provider("github"), store)  # type: ignore[arg-type]
 
 
@@ -346,16 +346,19 @@ def _build_oidc_app(
     monkeypatch: pytest.MonkeyPatch,
     *,
     provider_type: str = "oidc",
+    provider: object | None = None,
 ) -> Iterator[TestClient]:
     """Build a real app through ``create_app`` with an OIDC auth provider.
 
     The provider is constructed directly rather than through
     ``create_auth_provider`` so no IdP discovery request is made; everything
     downstream — including the device-grant mount decision — is the
-    production path.
+    production path. ``provider`` overrides it outright, for modes that need
+    no OIDC config at all.
     """
     monkeypatch.setenv("OMNIGENT_DEVICE_GRANT_ENABLED", "1")
-    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+    if provider is None:
+        monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
 
     db_url = f"sqlite:///{tmp_path}/test.db"
     from omnigent.db.utils import get_or_create_engine
@@ -420,7 +423,7 @@ def _build_oidc_app(
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
-        auth_provider=UnifiedAuthProvider(source="oidc", oidc_config=config),
+        auth_provider=provider or UnifiedAuthProvider(source="oidc", oidc_config=config),
     )
     with TestClient(app) as client:
         yield client
@@ -741,8 +744,12 @@ def test_no_secret_configured_stays_public(app: TestClient) -> None:
     assert r.status_code == 200, r.text
 
 
-def _capture_app_warnings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Build the accounts app and return WARNING messages from ``server.app``.
+def _capture_app_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builder: Callable[[], Iterator[TestClient]] | None = None,
+) -> list[str]:
+    """Build an app and return WARNING messages from ``server.app``.
 
     Attaches a handler directly to the ``omnigent.server.app`` logger rather
     than using ``caplog``: the server's telemetry/logging init runs during the
@@ -760,7 +767,7 @@ def _capture_app_warnings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> li
     handler = _Collector()
     logger.addHandler(handler)
     try:
-        for _ in _build_accounts_app(tmp_path, monkeypatch):
+        for _ in builder() if builder else _build_accounts_app(tmp_path, monkeypatch):
             break  # build (and immediately tear down) so the mount runs
     finally:
         logger.removeHandler(handler)
@@ -787,3 +794,91 @@ def test_startup_silent_when_client_secret_set(
     monkeypatch.setenv("OMNIGENT_DEVICE_CLIENT_SECRET", _SECRET)
     warnings = _capture_app_warnings(tmp_path, monkeypatch)
     assert not any("OMNIGENT_DEVICE_CLIENT_SECRET is not set" in m for m in warnings)
+
+
+def _build_header_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """A header/proxy-mode app with the device grant requested."""
+    monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "1")
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    yield from _build_oidc_app(
+        tmp_path, monkeypatch, provider=UnifiedAuthProvider(source="header")
+    )
+
+
+def test_refusal_is_explained_in_header_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Header mode must still learn WHY /oauth/* is missing.
+
+    It is one of the two cases ``unsupported_reason`` exists to explain, and
+    also the mode where the auth router itself never mounts (``login_url`` is
+    None). Deciding device-grant support inside that mount block meant the
+    operator most likely to be confused saw only silence.
+    """
+    warnings = _capture_app_warnings(
+        tmp_path, monkeypatch, builder=lambda: _build_header_app(tmp_path, monkeypatch)
+    )
+
+    assert any(
+        "OMNIGENT_DEVICE_GRANT_ENABLED is set" in message and "no server-minted session" in message
+        for message in warnings
+    ), warnings
+
+
+def test_refusal_is_explained_for_github_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same for a GitHub-backed OIDC deployment."""
+    warnings = _capture_app_warnings(
+        tmp_path,
+        monkeypatch,
+        builder=lambda: _build_oidc_app(tmp_path, monkeypatch, provider_type="github"),
+    )
+
+    assert any(
+        "OMNIGENT_DEVICE_GRANT_ENABLED is set" in message and "not full OIDC" in message
+        for message in warnings
+    ), warnings
+
+
+def test_a_supported_deployment_logs_no_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The predicate must not over-refuse: real OIDC mounts silently."""
+    warnings = _capture_app_warnings(
+        tmp_path, monkeypatch, builder=lambda: _build_oidc_app(tmp_path, monkeypatch)
+    )
+
+    assert not any("routes are NOT mounted" in message for message in warnings), warnings
+
+
+def test_unsupported_reason_refuses_an_unaudited_provider_type() -> None:
+    """Allowlisted, not denylisted.
+
+    ``from_env`` yields only ``github`` or ``oidc`` today, so denying the one
+    known-bad value happened to be equivalent. The next OAuth dialect modelled
+    under this source — or a directly-constructed config — would have been
+    admitted by default, behind a gate that cannot hold for it.
+    """
+
+    from omnigent.server.routes.device_auth import unsupported_reason
+
+    for provider_type in ("github", "gitlab", "oauth2", ""):
+        reason = unsupported_reason(_oidc_provider(provider_type))  # type: ignore[arg-type]
+        assert reason is not None, provider_type
+        assert repr(provider_type) in reason, "the reason must name the value it refused"
+
+    assert unsupported_reason(_oidc_provider("oidc")) is None  # type: ignore[arg-type]
+
+
+def test_unsupported_reason_refuses_oidc_with_no_config() -> None:
+    """A missing config is not a supported deployment."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.device_auth import unsupported_reason
+
+    provider = SimpleNamespace(_source="oidc", _oidc_config=None, _accounts_config=None)
+    assert unsupported_reason(provider) is not None  # type: ignore[arg-type]

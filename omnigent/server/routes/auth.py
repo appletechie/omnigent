@@ -46,8 +46,9 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
-# Tolerance when comparing the IdP's `auth_time` against our own clock.
-_REAUTH_CLOCK_SKEW_SECONDS = 60
+# How long the IdP may take between authenticating the user and signing the
+# id_token. Both timestamps are the IdP's own, so this is not clock skew.
+_REAUTH_PROCESSING_ALLOWANCE_SECONDS = 120
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -287,6 +288,11 @@ def create_auth_router(
             "code_verifier": code_verifier,
         }
 
+        # When (on our clock) the user proved their identity to the IdP for
+        # THIS login. Stays None unless the IdP attests to it — GitHub OAuth
+        # never can, which is why it cannot carry a device grant.
+        proven_at: int | None = None
+
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
             # response from the token endpoint.
@@ -327,12 +333,17 @@ def create_auth_router(
             else:
                 email = _resolve_oidc_email(token_json, config)
 
+            # Record whether the user actually proved themselves here, rather
+            # than the IdP silently reusing its own session. Checked on EVERY
+            # login, not only the forced ones: the device-grant consent gate
+            # reads this, and a login that skipped the bounce would otherwise
+            # look identical to one that honoured it.
+            if _idp_reauthenticated(token_json, config):
+                proven_at = int(time.time())
+
             # This login was demanded by a device-grant consent bounce, so a
             # session the IdP simply reused is not good enough.
-            reauth_at = state_payload.get("reauth_at")
-            if isinstance(reauth_at, int) and not _reauthenticated_after(
-                token_json, config, reauth_at
-            ):
+            if state_payload.get("reauth_at") is not None and proven_at is None:
                 return JSONResponse(
                     status_code=403,
                     content={"error": "Re-authentication was required but did not occur"},
@@ -387,12 +398,16 @@ def create_auth_router(
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
 
-        # Mint session cookie.
+        # Mint session cookie. `auth_time` carries the proof forward: under
+        # OIDC a completed callback says nothing about user involvement, so
+        # consumers that need a deliberate authentication must read this
+        # rather than `iat`.
         session_jwt = mint_session_cookie(
             user_id=email,
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
+            auth_time=proven_at,
         )
 
         # Check if this callback fulfills a CLI login ticket.
@@ -841,26 +856,30 @@ def _verified_id_token_claims(
     return claims
 
 
-def _reauthenticated_after(
+def _idp_reauthenticated(
     token_json: dict[str, object],
     config: OIDCConfig,
-    not_before: int,
 ) -> bool:
-    """Did the IdP actually re-authenticate the user for this login?
+    """Did the IdP authenticate the user *for this login*, or reuse a session?
 
     ``prompt=login`` and ``max_age=0`` are requests. This is the check that
-    they were honoured: a conforming IdP that re-authenticates must report
-    when it did, via the ``auth_time`` claim, and that moment has to fall
-    after the bounce that demanded it.
+    they were honoured: a conforming IdP reports when it authenticated the
+    user via ``auth_time``, and for a genuine re-authentication that moment
+    coincides with this token's own issuance.
+
+    Both values come from the IdP's clock, so they are compared against each
+    other rather than against ours — a skew between the two servers cancels
+    out, and a session the IdP established minutes or hours ago fails the
+    comparison no matter whose clock is ahead. The allowance covers the
+    IdP's own processing between authenticating the user and signing the
+    token, not clock drift.
 
     Fails closed. A missing ``auth_time`` means the IdP did not answer the
     question, which is indistinguishable from it having reused an existing
-    session — and this is the only gate standing between a phished consent
-    link and a delegated grant.
+    session.
 
     :param token_json: The token endpoint response JSON.
     :param config: The OIDC configuration.
-    :param not_before: Epoch seconds the re-authentication must postdate.
     :returns: True only on a proven fresh authentication.
     """
     claims = _verified_id_token_claims(token_json, config)
@@ -870,13 +889,16 @@ def _reauthenticated_after(
     auth_time = claims.get("auth_time")
     if not isinstance(auth_time, int):
         _logger.warning(
-            "Forced re-authentication could not be verified: the id_token has no "
+            "Re-authentication could not be verified: the id_token has no "
             "integer auth_time claim, so the IdP may have reused an existing session"
         )
         return False
 
-    # Small tolerance for clock skew between us and the IdP.
-    return auth_time >= not_before - _REAUTH_CLOCK_SKEW_SECONDS
+    issued_at = claims.get("iat")
+    if not isinstance(issued_at, int):
+        return False
+
+    return auth_time >= issued_at - _REAUTH_PROCESSING_ALLOWANCE_SECONDS
 
 
 def _resolve_oidc_email(
