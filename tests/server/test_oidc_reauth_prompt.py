@@ -91,6 +91,10 @@ def test_reauth_forwards_prompt_login_to_the_idp(oidc_client: TestClient) -> Non
     params = _authorize_params(oidc_client, "?reauth=1&return_to=/oauth/device")
 
     assert params.get("prompt") == ["login"]
+    # `prompt` alone is only a request. `max_age=0` is what obliges a
+    # conforming IdP to return `auth_time`, which is what the callback then
+    # verifies — drop it and the gate degrades to asking politely.
+    assert params.get("max_age") == ["0"]
     # The rest of the request must be unchanged — PKCE and state still apply.
     assert params["code_challenge_method"] == ["S256"]
     assert params["response_type"] == ["code"]
@@ -104,8 +108,10 @@ def test_an_ordinary_login_does_not_re_prompt(oidc_client: TestClient) -> None:
     every single sign-in, which is how a security control ends up switched
     off by whoever finds it annoying.
     """
-    assert "prompt" not in _authorize_params(oidc_client, "")
-    assert "prompt" not in _authorize_params(oidc_client, "?return_to=/sessions")
+    for query in ("", "?return_to=/sessions"):
+        params = _authorize_params(oidc_client, query)
+        assert "prompt" not in params
+        assert "max_age" not in params
 
 
 @pytest.mark.parametrize("raw", ["0", "true", "yes", "", "1 ", "TRUE"])
@@ -173,14 +179,51 @@ def test_consent_page_renders_for_a_real_oidc_session_cookie(tmp_path: Path) -> 
         assert res.status_code == 200, res.text
         user_code = res.json()["user_code"]
 
-        # A login that happens AFTER the grant, exactly as the forced bounce
-        # would produce.
-        time.sleep(1)
-        session = mint_session_cookie("alice@example.com", config.cookie_secret, 8, "oidc")
-        client.cookies.set(config.session_cookie_name, session)
+        # A session with no proven authentication — the shape an ordinary
+        # OIDC login produces when the IdP reuses its own session.
+        unproven = mint_session_cookie("alice@example.com", config.cookie_secret, 8, "oidc")
+        client.cookies.set(config.session_cookie_name, unproven)
+        bounced = client.get(f"/oauth/device?user_code={user_code}", follow_redirects=False)
 
+        # An authentication proven AFTER the grant began, exactly as the
+        # forced bounce produces.
+        time.sleep(1)
+        proven = mint_session_cookie(
+            "alice@example.com",
+            config.cookie_secret,
+            8,
+            "oidc",
+            auth_time=int(time.time()),
+        )
+        client.cookies.set(config.session_cookie_name, proven)
         page = client.get(f"/oauth/device?user_code={user_code}", follow_redirects=False)
+
+    assert bounced.status_code == 302, "an unproven session must not reach consent"
+    assert "reauth=1" in bounced.headers["location"]
 
     assert page.status_code == 200, f"consent bounced instead of rendering: {page.headers}"
     assert "alice@example.com" in page.text, "the consent screen must name the identity"
     assert "polly" in page.text, "and the client asking for access"
+
+
+def test_reauth_is_signed_into_the_state_cookie(oidc_client: TestClient) -> None:
+    """`/auth/login` must record the demand where the callback can trust it.
+
+    The callback refuses a login that failed to re-authenticate only when
+    the state carries ``reauth_at``. Signed into the cookie rather than read
+    back off the URL, so it cannot be stripped by editing the redirect.
+    """
+    import jwt
+
+    oidc_client.get("/auth/login?reauth=1&return_to=/oauth/device", follow_redirects=False)
+    claims = jwt.decode(oidc_client.cookies["ap_auth_state"], _TEST_SECRET, algorithms=["HS256"])
+    assert isinstance(claims.get("reauth_at"), int)
+
+
+def test_an_ordinary_login_signs_no_reauth_marker(oidc_client: TestClient) -> None:
+    """Without it the callback must not demand proof of every sign-in."""
+    import jwt
+
+    oidc_client.get("/auth/login?return_to=/sessions", follow_redirects=False)
+    claims = jwt.decode(oidc_client.cookies["ap_auth_state"], _TEST_SECRET, algorithms=["HS256"])
+    assert "reauth_at" not in claims

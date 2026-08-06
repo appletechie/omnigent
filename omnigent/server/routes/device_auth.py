@@ -287,11 +287,20 @@ def unsupported_reason(auth_provider: UnifiedAuthProvider) -> str | None:
         return f"{source!r} auth has no server-minted session to delegate from"
     if source == "oidc":
         config = auth_provider._oidc_config
-        if config is not None and config.provider_type == "github":
+        if config is None:
+            return "oidc auth is selected but no OIDC config is present"
+        # Allowlisted, not denylisted. `provider_type` distinguishes real
+        # OIDC from OAuth 2.0 dialects modelled under the same source, and
+        # only the former can be asked to re-authenticate (`prompt=login`)
+        # and made to attest that it did (`auth_time`). Admitting an
+        # unaudited value by default would silently issue grants behind a
+        # gate that cannot hold — which is the failure this predicate exists
+        # to prevent.
+        if config.provider_type != "oidc":
             return (
-                "GitHub OAuth cannot be asked to re-authenticate an already "
-                "signed-in user (no OIDC 'prompt' parameter), so the consent "
-                "page's forced-re-authentication gate would not hold"
+                f"{config.provider_type!r} is not full OIDC, so it cannot be asked to "
+                "re-authenticate an already signed-in user ('prompt=login') nor attest "
+                "that it did ('auth_time'), and the consent page's gate would not hold"
             )
     return None
 
@@ -450,14 +459,24 @@ def create_device_auth_router(
         query = f"return_to={html.escape(return_to, quote=True)}&reauth=1"
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
-    def _session_iat(request: Request) -> int | None:
-        """Return the ``iat`` (issue time) of the caller's session JWT.
+    def _session_auth_time(request: Request) -> int | None:
+        """When did this session's owner last *prove* who they are?
 
-        Read from the session cookie. Both modes mint a fresh ``iat`` on
-        every completed login — accounts on the ``/auth/login`` POST, OIDC
-        in the ``/auth/callback`` handler — so this is effectively the
-        last-login time. ``None`` when absent/invalid. Used to enforce that
-        consent follows a login started FOR this device flow.
+        Deliberately not ``iat``. Minting a session proves only that a login
+        flow completed, and under OIDC that can happen with no user
+        involvement: an attacker who sends a victim a plain
+        ``/auth/login?return_to=/oauth/device?user_code=…`` link — no
+        ``reauth=1`` — gets the IdP to satisfy it from its own session, and
+        the resulting cookie carries an ``iat`` of *now*. Gating on ``iat``
+        therefore let a crafted link walk straight past the consent check by
+        simply never asking for the re-authentication.
+
+        ``auth_time`` is written only where a credential was actually
+        presented (see :func:`omnigent.server.oidc.mint_session_token`), so
+        it cannot be manufactured by starting a login flow.
+
+        ``None`` when absent or invalid, which callers must treat as
+        unproven.
         """
         token = request.cookies.get(cookie_config.session_cookie_name)
         if not token:
@@ -466,8 +485,8 @@ def create_device_auth_router(
             payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        iat = payload.get("iat")
-        return iat if isinstance(iat, int) else None
+        auth_time = payload.get("auth_time")
+        return auth_time if isinstance(auth_time, int) else None
 
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
@@ -509,12 +528,12 @@ def create_device_auth_router(
                 status_code=200,
             )
 
-        # Force a fresh login when the current session predates this grant:
-        # only a login started for THIS flow (iat ≥ the grant's created_at)
-        # may approve. Bounce with reauth=1 so the login page re-prompts
-        # rather than auto-returning the stale session (which would loop).
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        # Only a credential presented for THIS flow may approve it: the
+        # proven-authentication time must postdate the grant. Bounce with
+        # reauth=1 so the login page re-prompts rather than auto-returning
+        # the existing session (which would loop).
+        proven_at = _session_auth_time(request)
+        if proven_at is None or proven_at < grant.created_at:
             return _bounce_to_login(user_code)
 
         return HTMLResponse(
@@ -550,10 +569,10 @@ def create_device_auth_router(
             )
 
         # Re-auth gate, enforced here too (not just on the consent GET): a
-        # stale session must not approve by POSTing directly. Only a login
-        # started for THIS flow (session iat ≥ the grant's created_at) passes.
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        # stale session must not approve by POSTing directly. Only a
+        # credential proven for THIS flow passes.
+        proven_at = _session_auth_time(request)
+        if proven_at is None or proven_at < grant.created_at:
             return HTMLResponse(
                 _consent_html(
                     error="Your session is too old to approve this login. "
