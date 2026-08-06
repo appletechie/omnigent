@@ -2409,22 +2409,34 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, for the two modes that own a
-        # server-minted session cookie: accounts and OIDC. Under OIDC the
-        # consent page bounces the browser through /auth/login and the IdP
-        # decides how the user proves themselves, so the grant works without
-        # this module knowing anything about credentials. Header mode is
-        # excluded — identity is asserted by an upstream proxy, so there is no
-        # session to delegate from and no login to bounce through. Wires the
-        # revocation lookup into the auth provider so revoking a grant
-        # immediately rejects its delegated access tokens.
+        # OMNIGENT_DEVICE_GRANT_ENABLED, and only for providers that can be
+        # made to re-prompt an already signed-in user — see
+        # `unsupported_reason`, which owns that rule. Wires the revocation
+        # lookup into the auth provider so revoking a grant immediately
+        # rejects its delegated access tokens.
         # See designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
+        from omnigent.server.routes.device_auth import unsupported_reason
+
+        _device_grant_wanted = env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+        _device_grant_blocked = (
+            unsupported_reason(auth_provider)
+            if isinstance(auth_provider, UnifiedAuthProvider)
+            else "a custom auth provider cannot mint the session the grant delegates from"
+        )
+        if _device_grant_wanted and _device_grant_blocked is not None:
+            # Asked for and refused: say so, or the operator sees only the
+            # absence of /oauth/* and assumes the flag did not take.
+            _logger.warning(
+                "device-grant: OMNIGENT_DEVICE_GRANT_ENABLED is set but the "
+                "/oauth/* routes are NOT mounted — %s. See designs/DEVICE_AUTH.md.",
+                _device_grant_blocked,
+            )
 
         if (
-            env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+            _device_grant_wanted
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source in ("accounts", "oidc")
+            and _device_grant_blocked is None
             and permission_store is not None
         ):
             from omnigent.server.device_grant_store import DeviceGrantStore
