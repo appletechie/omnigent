@@ -46,6 +46,8 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# Tolerance when comparing the IdP's `auth_time` against our own clock.
+_REAUTH_CLOCK_SKEW_SECONDS = 60
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -170,8 +172,10 @@ def create_auth_router(
         invite = request.query_params.get("invite") if _invites_enabled else None
         # Forced re-authentication, requested by the device-grant consent page.
         # Without it the IdP satisfies the bounce from its own session and the
-        # consent gate passes on a user who proved nothing.
-        reauth = request.query_params.get("reauth") == "1"
+        # consent gate passes on a user who proved nothing. GitHub OAuth has
+        # no way to demand or report it, so it never gets here — see
+        # `device_auth.unsupported_reason`.
+        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
 
         # Store state + code_verifier in a short-lived signed cookie.
         state_payload: dict[str, str | int] = {
@@ -184,6 +188,10 @@ def create_auth_router(
             state_payload["ticket"] = ticket
         if invite:
             state_payload["invite"] = invite
+        if reauth:
+            # Signed, so the callback's freshness check cannot be removed by
+            # editing the URL.
+            state_payload["reauth_at"] = int(time.time())
         state_jwt = jwt.encode(state_payload, config.cookie_secret, algorithm="HS256")
 
         # Build the authorization URL.
@@ -198,9 +206,10 @@ def create_auth_router(
         }
         if reauth:
             # OIDC Core 3.1.2.1: re-prompt even when the IdP has a session.
-            # Only on this path — as a default it would cost a password on
-            # every sign-in, and get switched off.
+            # `max_age=0` makes it enforceable — it obliges a conforming IdP
+            # to return `auth_time`, which the callback then verifies.
             params["prompt"] = "login"
+            params["max_age"] = "0"
         auth_url = config.authorization_endpoint + "?" + urlencode(params)
 
         response = RedirectResponse(url=auth_url, status_code=302)
@@ -317,6 +326,17 @@ def create_auth_router(
                 )
             else:
                 email = _resolve_oidc_email(token_json, config)
+
+            # This login was demanded by a device-grant consent bounce, so a
+            # session the IdP simply reused is not good enough.
+            reauth_at = state_payload.get("reauth_at")
+            if isinstance(reauth_at, int) and not _reauthenticated_after(
+                token_json, config, reauth_at
+            ):
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "Re-authentication was required but did not occur"},
+                )
 
         if not email:
             return JSONResponse(
@@ -781,6 +801,84 @@ def _claim_is_verified_true(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
+def _verified_id_token_claims(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+) -> dict[str, object] | None:
+    """Validate the ``id_token`` and return its claims.
+
+    Checks the JWT signature against the IdP's JWKS and verifies ``iss``
+    and ``aud``. Shared by every consumer so no caller can read a claim out
+    of an unverified token.
+
+    :param token_json: The token endpoint response JSON.
+    :param config: The OIDC configuration with JWKS URI and expected
+        issuer/audience.
+    :returns: The verified claims, or ``None`` when the token is missing,
+        unverifiable, or the config has no JWKS URI.
+    """
+    id_token = token_json.get("id_token")
+    if not isinstance(id_token, str) or not id_token:
+        return None
+    if config.jwks_uri is None:
+        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
+        return None
+
+    try:
+        jwks_client = jwt.PyJWKClient(config.jwks_uri)
+        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
+        claims: dict[str, object] = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            audience=config.client_id,
+            issuer=config.issuer,
+        )
+    except jwt.InvalidTokenError as exc:
+        _logger.warning("id_token validation failed: %s", exc)
+        return None
+
+    return claims
+
+
+def _reauthenticated_after(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+    not_before: int,
+) -> bool:
+    """Did the IdP actually re-authenticate the user for this login?
+
+    ``prompt=login`` and ``max_age=0`` are requests. This is the check that
+    they were honoured: a conforming IdP that re-authenticates must report
+    when it did, via the ``auth_time`` claim, and that moment has to fall
+    after the bounce that demanded it.
+
+    Fails closed. A missing ``auth_time`` means the IdP did not answer the
+    question, which is indistinguishable from it having reused an existing
+    session — and this is the only gate standing between a phished consent
+    link and a delegated grant.
+
+    :param token_json: The token endpoint response JSON.
+    :param config: The OIDC configuration.
+    :param not_before: Epoch seconds the re-authentication must postdate.
+    :returns: True only on a proven fresh authentication.
+    """
+    claims = _verified_id_token_claims(token_json, config)
+    if claims is None:
+        return False
+
+    auth_time = claims.get("auth_time")
+    if not isinstance(auth_time, int):
+        _logger.warning(
+            "Forced re-authentication could not be verified: the id_token has no "
+            "integer auth_time claim, so the IdP may have reused an existing session"
+        )
+        return False
+
+    # Small tolerance for clock skew between us and the IdP.
+    return auth_time >= not_before - _REAUTH_CLOCK_SKEW_SECONDS
+
+
 def _resolve_oidc_email(
     token_json: dict[str, object],
     config: OIDCConfig,
@@ -819,25 +917,8 @@ def _resolve_oidc_email(
         ``email_verified`` is not truthy (and verification is not
         skipped via config).
     """
-    id_token = token_json.get("id_token")
-    if not isinstance(id_token, str) or not id_token:
-        return None
-    if config.jwks_uri is None:
-        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
-        return None
-
-    try:
-        jwks_client = jwt.PyJWKClient(config.jwks_uri)
-        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
-        claims = jwt.decode(
-            id_token,
-            signing_key.key,
-            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
-            audience=config.client_id,
-            issuer=config.issuer,
-        )
-    except jwt.InvalidTokenError as exc:
-        _logger.warning("id_token validation failed: %s", exc)
+    claims = _verified_id_token_claims(token_json, config)
+    if claims is None:
         return None
 
     email = claims.get(config.email_claim)
