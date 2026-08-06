@@ -663,6 +663,12 @@ _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    # ACP sessions reuse the codex route: it is the runner's generic
+    # model-options endpoint, and it answers ACP-backed sessions from the
+    # running subprocess's SessionModelState (see ``_harness_is_acp_backed``
+    # in ``runner/app.py``). Without an entry here the fetch never runs and
+    # the picker stays empty no matter what the agent advertises.
+    _ACP_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
     # not fetched from a runner route, so the picker works in every auth path
