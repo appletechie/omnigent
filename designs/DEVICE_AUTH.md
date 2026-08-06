@@ -199,7 +199,22 @@ demands a password. OIDC has no form to hold back, so `/auth/login` forwards
 forwarding does not break the flow — the IdP satisfies the bounce from its own
 session and the callback mints a fresh `iat` that clears the gate — it just
 silently removes the deliberate-credential-entry property the gate exists for.
-Pinned by `tests/server/test_oidc_reauth_prompt.py`. The `device_grants` table is created
+Pinned by `tests/server/test_oidc_reauth_prompt.py`.
+
+*Every* bounce is forced, including the one for a caller with no Omnigent
+session. Under accounts that changes nothing — no session means no credential,
+so the form is shown regardless — but under OIDC the caller may still hold a
+live IdP session, and the consent page cannot tell the two cases apart.
+
+**Why GitHub is excluded.** `OIDCConfig.from_env` accepts GitHub as an `oidc`
+source, but points it at `https://github.com/login/oauth/authorize` — plain
+OAuth 2.0, which has no `prompt` parameter. `prompt=login` would be ignored,
+GitHub would reuse its session, and the callback's fresh `iat` would clear the
+gate. `unsupported_reason` therefore refuses the grant for that provider
+outright: a grant issued behind a gate that cannot hold is worse than no grant,
+because it looks protected. `app.py` logs the refusal so an operator who set
+`OMNIGENT_DEVICE_GRANT_ENABLED` is told why `/oauth/*` is absent instead of
+assuming the flag did not take. The `device_grants` table is created
 unconditionally by the migration regardless of the flag; only the router
 mount is gated. This router **owns** `mint_delegated_token` and
 `DELEGATED_SCOPE`.

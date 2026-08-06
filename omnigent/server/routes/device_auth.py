@@ -264,6 +264,38 @@ class _SlidingWindowRateLimiter:
         return True
 
 
+def unsupported_reason(auth_provider: UnifiedAuthProvider) -> str | None:
+    """Why this provider cannot carry a device grant, or ``None`` if it can.
+
+    The consent gate is only as strong as the login path's ability to
+    re-prompt a user the provider has already authenticated. Where that
+    cannot be demanded the grant is refused outright rather than issued
+    behind a gate that silently passes.
+
+    - ``header`` — identity comes from an upstream proxy: no session to
+      delegate from, and no login to bounce a consenting browser through.
+    - ``github`` — configured as an OIDC source, but GitHub's OAuth
+      authorization endpoint is not OIDC and has no ``prompt`` parameter.
+      It would ignore ``prompt=login``, reuse its session, and return a
+      callback whose fresh ``iat`` clears the gate.
+
+    :param auth_provider: The active provider.
+    :returns: A human-readable reason, or ``None`` when supported.
+    """
+    source = auth_provider._source
+    if source not in ("accounts", "oidc"):
+        return f"{source!r} auth has no server-minted session to delegate from"
+    if source == "oidc":
+        config = auth_provider._oidc_config
+        if config is not None and config.provider_type == "github":
+            return (
+                "GitHub OAuth cannot be asked to re-authenticate an already "
+                "signed-in user (no OIDC 'prompt' parameter), so the consent "
+                "page's forced-re-authentication gate would not hold"
+            )
+    return None
+
+
 def create_device_auth_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
@@ -276,14 +308,9 @@ def create_device_auth_router(
     :param device_grant_store: Persistence for device grants.
     :returns: APIRouter to mount at the app root.
     """
-    # Header mode stays out: identity there is asserted by an upstream proxy
-    # and there is no server-mintable session, so there is nothing to delegate
-    # FROM and no login to bounce a consenting browser through.
-    if auth_provider._source not in ("accounts", "oidc"):
-        raise RuntimeError(
-            "create_device_auth_router requires accounts or oidc auth "
-            f"(got {auth_provider._source!r})"
-        )
+    reason = unsupported_reason(auth_provider)
+    if reason is not None:
+        raise RuntimeError(f"create_device_auth_router cannot build: {reason}")
     # Both modes sign the same HS256 session cookie and both configs expose
     # `cookie_secret`, `session_cookie_name` and `base_url` — see the
     # AccountsConfig docstring and UnifiedAuthProvider._check_cookie, which
@@ -409,20 +436,18 @@ def create_device_auth_router(
 
     # ── Browser consent page ──────────────────────────────────────
 
-    def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
-        """302 to the login page, returning to this consent URL afterward.
+    def _bounce_to_login(user_code: str) -> RedirectResponse:
+        """302 to the login page with ``reauth=1``, returning here afterward.
 
-        ``reauth`` adds ``&reauth=1``, which forces a fresh credential entry
-        instead of auto-bouncing an already-signed-in user (which would loop
-        back here with the same stale session). Both login paths honour it:
-        the accounts SPA holds back its auto-redirect and shows the password
-        form, and ``/auth/login`` forwards it to the IdP as ``prompt=login``.
+        Always forced, on every bounce. "No Omnigent session" does not mean
+        "no credential" under OIDC — the IdP holds its own, and would satisfy
+        an unforced bounce silently. The accounts SPA holds back its
+        auto-redirect and shows the password form; ``/auth/login`` forwards
+        this to the IdP as ``prompt=login``.
         """
         login_url = auth_provider.login_url or "/login"
         return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
-        query = f"return_to={html.escape(return_to, quote=True)}"
-        if reauth:
-            query += "&reauth=1"
+        query = f"return_to={html.escape(return_to, quote=True)}&reauth=1"
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
     def _session_iat(request: Request) -> int | None:
@@ -458,15 +483,20 @@ def create_device_auth_router(
         device flow began (session ``iat`` ≥ the grant's ``created_at``). A
         pre-existing session — however recent — is bounced back through the
         login page with ``reauth=1``, so approving a device grant always
-        costs a deliberate, fresh password entry. This closes the
+        costs a deliberate, fresh credential entry. This closes the
         reflex-approve phishing case: a victim already signed in can't bind
-        an attacker's grant with one click; they must re-enter their password
+        an attacker's grant with one click; they must re-authenticate
         against a screen naming the exact identity and client.
+
+        Every bounce forces it, including the one for a caller with no
+        Omnigent session at all. Under OIDC that caller may still hold a
+        live IdP session, which would satisfy an unforced bounce without
+        their involvement.
         """
         user_id = auth_provider.get_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
         if user_id is None:
-            return _bounce_to_login(user_code, reauth=False)
+            return _bounce_to_login(user_code)
 
         if not user_code:
             return HTMLResponse(_consent_html(prompt_for_code=True), status_code=200)
@@ -485,7 +515,7 @@ def create_device_auth_router(
         # rather than auto-returning the stale session (which would loop).
         session_iat = _session_iat(request)
         if session_iat is None or session_iat < grant.created_at:
-            return _bounce_to_login(user_code, reauth=True)
+            return _bounce_to_login(user_code)
 
         return HTMLResponse(
             _consent_html(

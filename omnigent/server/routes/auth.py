@@ -168,16 +168,9 @@ def create_auth_router(
         # before the callback redeems it. Only meaningful when invites
         # are enabled; ignored otherwise.
         invite = request.query_params.get("invite") if _invites_enabled else None
-        # Forced re-authentication, set by the device-grant consent page when
-        # the caller's session predates the grant it is being asked to approve.
-        #
-        # Accounts mode implements this in the SPA login form (it skips its
-        # auto-bounce and demands a password). OIDC has no form to hold back —
-        # the IdP owns the credential — so it has to be asked, and `prompt` is
-        # the OIDC parameter for asking. Without it the bounce is satisfied by
-        # the IdP's own session: the user is redirected out and straight back
-        # with a fresh `iat`, having proven nothing. The consent gate would
-        # still pass, which is precisely why this cannot be left implicit.
+        # Forced re-authentication, requested by the device-grant consent page.
+        # Without it the IdP satisfies the bounce from its own session and the
+        # consent gate passes on a user who proved nothing.
         reauth = request.query_params.get("reauth") == "1"
 
         # Store state + code_verifier in a short-lived signed cookie.
@@ -204,10 +197,9 @@ def create_auth_router(
             "code_challenge_method": "S256",
         }
         if reauth:
-            # OIDC Core 3.1.2.1: re-prompt for credentials even when the IdP
-            # already has a session. Sent only on this path — making it the
-            # default would re-prompt on every ordinary login, which is how a
-            # security control gets switched off.
+            # OIDC Core 3.1.2.1: re-prompt even when the IdP has a session.
+            # Only on this path — as a default it would cost a password on
+            # every sign-in, and get switched off.
             params["prompt"] = "login"
         auth_url = config.authorization_endpoint + "?" + urlencode(params)
 

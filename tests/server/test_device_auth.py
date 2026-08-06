@@ -41,8 +41,54 @@ def test_router_factory_rejects_header_mode(tmp_path: Path) -> None:
 
     provider = SimpleNamespace(_source="header")
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
-    with pytest.raises(RuntimeError, match="accounts or oidc"):
+    with pytest.raises(RuntimeError, match="no server-minted session"):
         create_device_auth_router(provider, store)  # type: ignore[arg-type]
+
+
+def _oidc_provider(provider_type: str) -> object:
+    """A minimal OIDC-shaped provider stub for the mount-guard tests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(
+            cookie_secret=b"o" * 32,
+            base_url="https://omnigent.example.com",
+            session_cookie_name="__Host-ap_session",
+            provider_type=provider_type,
+        ),
+        _accounts_config=None,
+        login_url="/auth/login",
+    )
+
+
+def test_router_factory_rejects_github_oauth(tmp_path: Path) -> None:
+    """GitHub is an ``oidc`` source pointed at a NON-OIDC endpoint.
+
+    ``OIDCConfig.from_env`` sets ``provider_type="github"`` and
+    ``authorization_endpoint=https://github.com/login/oauth/authorize`` —
+    plain OAuth 2.0, which has no ``prompt`` parameter. It would ignore
+    ``prompt=login``, reuse its session, and hand back a callback whose fresh
+    ``iat`` clears the consent gate. Refused outright: a grant issued behind a
+    gate that cannot hold is worse than no grant, because it looks protected.
+    """
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    with pytest.raises(RuntimeError, match="GitHub OAuth"):
+        create_device_auth_router(_oidc_provider("github"), store)  # type: ignore[arg-type]
+
+
+def test_unsupported_reason_admits_standard_oidc_and_accounts() -> None:
+    """The predicate must not over-refuse: real OIDC and accounts both pass."""
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.device_auth import unsupported_reason
+
+    assert unsupported_reason(_oidc_provider("oidc")) is None  # type: ignore[arg-type]
+    assert unsupported_reason(SimpleNamespace(_source="accounts")) is None  # type: ignore[arg-type]
+    assert unsupported_reason(_oidc_provider("github")) is not None  # type: ignore[arg-type]
+    assert unsupported_reason(SimpleNamespace(_source="header")) is not None  # type: ignore[arg-type]
 
 
 def test_router_factory_builds_in_oidc_mode_from_the_oidc_config(tmp_path: Path) -> None:
@@ -53,21 +99,9 @@ def test_router_factory_builds_in_oidc_mode_from_the_oidc_config(tmp_path: Path)
     (None under OIDC) would trip the assert, and reading the wrong secret would
     sign device codes and refresh tokens with a key nothing else validates.
     """
-    from types import SimpleNamespace
-
     from omnigent.server.routes.device_auth import create_device_auth_router
 
-    oidc_secret = b"o" * 32
-    provider = SimpleNamespace(
-        _source="oidc",
-        _oidc_config=SimpleNamespace(
-            cookie_secret=oidc_secret,
-            base_url="https://omnigent.example.com",
-            session_cookie_name="__Host-ap_session",
-        ),
-        _accounts_config=None,
-        login_url="/auth/login",
-    )
+    provider = _oidc_provider("oidc")
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
 
     router = create_device_auth_router(provider, store)  # type: ignore[arg-type]
@@ -409,6 +443,19 @@ def test_consent_page_requires_login(app: TestClient) -> None:
     r = app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
     assert r.status_code == 302
     assert "/login" in r.headers["location"]
+
+
+def test_consent_forces_reauth_even_with_no_session_at_all(app: TestClient) -> None:
+    """The bounce for a caller with NO session must force re-authentication too.
+
+    Under accounts, "no session" means no credential and the SPA shows the
+    password form either way. Under OIDC it does not: the caller may still
+    hold a live IdP session, which would satisfy an unforced bounce silently
+    and return a fresh ``iat`` that clears the consent gate. The consent page
+    cannot tell the two apart, so every bounce is forced.
+    """
+    r = app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
+    assert "reauth=1" in r.headers["location"]
 
 
 def test_consent_forces_reauth_for_stale_session(app: TestClient) -> None:
