@@ -21,10 +21,17 @@ Endpoints (all mounted at the app root):
   returns delegated access + refresh tokens.
 - ``POST /oauth/revoke`` — revoke a grant (backs client logout).
 
-Mounted only in ``accounts`` auth mode (and only when
-``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). OIDC deployments delegate login
-to the IdP via the cli-ticket flow (``/auth/cli-login``) and never use this
-grant; header mode has no server-mintable identity.
+Mounted in ``accounts`` and ``oidc`` auth modes (and only when
+``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). Header mode has no
+server-mintable identity, so there is nothing to delegate from.
+
+Under OIDC the consent page bounces an unauthenticated (or stale) browser
+through ``/auth/login``, which hands off to the IdP — so whether the user
+proves themselves with a password, Google, or anything else is the IdP's
+business and never this module's. The forced-re-authentication gate below
+relies on that bounce carrying ``reauth=1`` through to ``prompt=login``;
+without it the IdP would satisfy the bounce from its own session and the
+gate would pass without the user having proven anything.
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.
 
@@ -263,17 +270,30 @@ def create_device_auth_router(
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
-    :param auth_provider: The active provider. Must be ``accounts`` mode;
-        its cookie config supplies the HMAC signing key and public base URL.
+    :param auth_provider: The active provider. Must be ``accounts`` or
+        ``oidc`` mode; its cookie config supplies the HMAC signing key and
+        public base URL.
     :param device_grant_store: Persistence for device grants.
     :returns: APIRouter to mount at the app root.
     """
-    if auth_provider._source != "accounts":
+    # Header mode stays out: identity there is asserted by an upstream proxy
+    # and there is no server-mintable session, so there is nothing to delegate
+    # FROM and no login to bounce a consenting browser through.
+    if auth_provider._source not in ("accounts", "oidc"):
         raise RuntimeError(
-            f"create_device_auth_router requires accounts auth (got {auth_provider._source!r})"
+            "create_device_auth_router requires accounts or oidc auth "
+            f"(got {auth_provider._source!r})"
         )
-    cookie_config = auth_provider._accounts_config
-    assert cookie_config is not None, "accounts mode must have an accounts config"
+    # Both modes sign the same HS256 session cookie and both configs expose
+    # `cookie_secret`, `session_cookie_name` and `base_url` — see the
+    # AccountsConfig docstring and UnifiedAuthProvider._check_cookie, which
+    # picks between them exactly this way.
+    cookie_config = (
+        auth_provider._oidc_config
+        if auth_provider._source == "oidc"
+        else auth_provider._accounts_config
+    )
+    assert cookie_config is not None, f"{auth_provider._source} mode must have a cookie config"
     cookie_secret = cookie_config.cookie_secret
     base_url = cookie_config.base_url
     provider_name = auth_provider._source
@@ -392,9 +412,11 @@ def create_device_auth_router(
     def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
         """302 to the login page, returning to this consent URL afterward.
 
-        ``reauth`` adds ``&reauth=1`` so the login page forces a fresh
-        password submit instead of auto-bouncing an already-signed-in user
-        (which would loop back here with the same stale session).
+        ``reauth`` adds ``&reauth=1``, which forces a fresh credential entry
+        instead of auto-bouncing an already-signed-in user (which would loop
+        back here with the same stale session). Both login paths honour it:
+        the accounts SPA holds back its auto-redirect and shows the password
+        form, and ``/auth/login`` forwards it to the IdP as ``prompt=login``.
         """
         login_url = auth_provider.login_url or "/login"
         return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
@@ -406,10 +428,11 @@ def create_device_auth_router(
     def _session_iat(request: Request) -> int | None:
         """Return the ``iat`` (issue time) of the caller's session JWT.
 
-        Read from the session cookie (accounts mode mints a fresh ``iat``
-        on every ``/auth/login``, so this is effectively the last-login
-        time). ``None`` when absent/invalid. Used to enforce that consent
-        follows a login started FOR this device flow.
+        Read from the session cookie. Both modes mint a fresh ``iat`` on
+        every completed login — accounts on the ``/auth/login`` POST, OIDC
+        in the ``/auth/callback`` handler — so this is effectively the
+        last-login time. ``None`` when absent/invalid. Used to enforce that
+        consent follows a login started FOR this device flow.
         """
         token = request.cookies.get(cookie_config.session_cookie_name)
         if not token:

@@ -31,19 +31,51 @@ _KEY = b"k" * 32
 # ── Router mount guard (unit) ─────────────────────────────────────
 
 
-@pytest.mark.parametrize("source", ["oidc", "header"])
-def test_router_factory_rejects_non_accounts_mode(source: str, tmp_path: Path) -> None:
-    """The device grant is accounts-mode only. OIDC delegates login to the IdP
-    (cli-ticket flow) and never uses these routes; header can't mint identity.
-    ``create_device_auth_router`` must refuse to build for either."""
+def test_router_factory_rejects_header_mode(tmp_path: Path) -> None:
+    """Header mode has no server-mintable session: identity is asserted by an
+    upstream proxy, so there is nothing to delegate FROM and no login to bounce
+    a consenting browser through. The factory must refuse to build."""
     from types import SimpleNamespace
 
     from omnigent.server.routes.device_auth import create_device_auth_router
 
-    provider = SimpleNamespace(_source=source)
+    provider = SimpleNamespace(_source="header")
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
-    with pytest.raises(RuntimeError, match="accounts"):
+    with pytest.raises(RuntimeError, match="accounts or oidc"):
         create_device_auth_router(provider, store)  # type: ignore[arg-type]
+
+
+def test_router_factory_builds_in_oidc_mode_from_the_oidc_config(tmp_path: Path) -> None:
+    """OIDC owns the same HS256 session cookie accounts does, so the grant
+    works there — the IdP simply decides how the user proves themselves.
+
+    The config must come from ``_oidc_config``: reading ``_accounts_config``
+    (None under OIDC) would trip the assert, and reading the wrong secret would
+    sign device codes and refresh tokens with a key nothing else validates.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    oidc_secret = b"o" * 32
+    provider = SimpleNamespace(
+        _source="oidc",
+        _oidc_config=SimpleNamespace(
+            cookie_secret=oidc_secret,
+            base_url="https://omnigent.example.com",
+            session_cookie_name="__Host-ap_session",
+        ),
+        _accounts_config=None,
+        login_url="/auth/login",
+    )
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+
+    router = create_device_auth_router(provider, store)  # type: ignore[arg-type]
+
+    paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
+    assert "/oauth/device/authorize" in paths
+    assert "/oauth/token" in paths
+    assert "/oauth/revoke" in paths
 
 
 # ── Store invariants (unit) ───────────────────────────────────────

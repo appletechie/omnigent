@@ -2409,17 +2409,22 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
-        # login to the IdP (cli-ticket flow), so it neither needs nor mounts
-        # these routes. Wires the revocation lookup into the auth provider so
-        # revoking a grant immediately rejects its delegated access tokens.
+        # OMNIGENT_DEVICE_GRANT_ENABLED, for the two modes that own a
+        # server-minted session cookie: accounts and OIDC. Under OIDC the
+        # consent page bounces the browser through /auth/login and the IdP
+        # decides how the user proves themselves, so the grant works without
+        # this module knowing anything about credentials. Header mode is
+        # excluded — identity is asserted by an upstream proxy, so there is no
+        # session to delegate from and no login to bounce through. Wires the
+        # revocation lookup into the auth provider so revoking a grant
+        # immediately rejects its delegated access tokens.
         # See designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source == "accounts"
+            and auth_provider._source in ("accounts", "oidc")
             and permission_store is not None
         ):
             from omnigent.server.device_grant_store import DeviceGrantStore

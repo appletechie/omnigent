@@ -143,6 +143,11 @@ def create_auth_router(
         ``state`` parameter. Stores them in a short-lived signed
         cookie so the callback can verify the response.
 
+        ``?reauth=1`` adds ``prompt=login``, forcing the IdP to re-prompt
+        for credentials even when it already has a session. The
+        device-grant consent page sets it; see
+        :mod:`omnigent.server.routes.device_auth`.
+
         :param request: The incoming FastAPI request.
         :returns: 302 redirect to the IdP with PKCE and state
             params.
@@ -163,6 +168,17 @@ def create_auth_router(
         # before the callback redeems it. Only meaningful when invites
         # are enabled; ignored otherwise.
         invite = request.query_params.get("invite") if _invites_enabled else None
+        # Forced re-authentication, set by the device-grant consent page when
+        # the caller's session predates the grant it is being asked to approve.
+        #
+        # Accounts mode implements this in the SPA login form (it skips its
+        # auto-bounce and demands a password). OIDC has no form to hold back —
+        # the IdP owns the credential — so it has to be asked, and `prompt` is
+        # the OIDC parameter for asking. Without it the bounce is satisfied by
+        # the IdP's own session: the user is redirected out and straight back
+        # with a fresh `iat`, having proven nothing. The consent gate would
+        # still pass, which is precisely why this cannot be left implicit.
+        reauth = request.query_params.get("reauth") == "1"
 
         # Store state + code_verifier in a short-lived signed cookie.
         state_payload: dict[str, str | int] = {
@@ -187,6 +203,12 @@ def create_auth_router(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
+        if reauth:
+            # OIDC Core 3.1.2.1: re-prompt for credentials even when the IdP
+            # already has a session. Sent only on this path — making it the
+            # default would re-prompt on every ordinary login, which is how a
+            # security control gets switched off.
+            params["prompt"] = "login"
         auth_url = config.authorization_endpoint + "?" + urlencode(params)
 
         response = RedirectResponse(url=auth_url, status_code=302)
