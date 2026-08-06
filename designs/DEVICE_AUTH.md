@@ -206,6 +206,16 @@ session. Under accounts that changes nothing — no session means no credential,
 so the form is shown regardless — but under OIDC the caller may still hold a
 live IdP session, and the consent page cannot tell the two cases apart.
 
+**Requested, then verified.** `prompt=login` is only a request, so the bounce
+also sends `max_age=0`, which obliges a conforming IdP to report the moment it
+authenticated the user in the `auth_time` claim. `/auth/login` signs the bounce
+time into the state cookie as `reauth_at`, and `/auth/callback` refuses (403,
+no session minted) unless the returned `auth_time` postdates it. A missing
+`auth_time` is refused too: silence is indistinguishable from a reused session,
+and this gate is the only thing between a phished consent link and a delegated
+grant. Ordinary logins carry no `reauth_at` and are unaffected — most IdPs omit
+the claim, and requiring it everywhere would break every sign-in.
+
 **Why GitHub is excluded.** `OIDCConfig.from_env` accepts GitHub as an `oidc`
 source, but points it at `https://github.com/login/oauth/authorize` — plain
 OAuth 2.0, which has no `prompt` parameter. `prompt=login` would be ignored,

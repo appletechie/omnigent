@@ -341,6 +341,126 @@ def _build_accounts_app(
         yield client
 
 
+def _build_oidc_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider_type: str = "oidc",
+) -> Iterator[TestClient]:
+    """Build a real app through ``create_app`` with an OIDC auth provider.
+
+    The provider is constructed directly rather than through
+    ``create_auth_provider`` so no IdP discovery request is made; everything
+    downstream — including the device-grant mount decision — is the
+    production path.
+    """
+    monkeypatch.setenv("OMNIGENT_DEVICE_GRANT_ENABLED", "1")
+    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.runtime import init as init_runtime
+    from omnigent.runtime import telemetry
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.oidc import OIDCConfig
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    get_or_create_engine(db_url)
+    telemetry.init()
+    permission_store = SqlAlchemyPermissionStore(db_url)
+    agent_store = SqlAlchemyAgentStore(db_url)
+    conversation_store = SqlAlchemyConversationStore(db_url)
+    file_store = SqlAlchemyFileStore(db_url)
+    comment_store = SqlAlchemyCommentStore(db_url)
+    host_store = HostStore(db_url)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache")
+    init_runtime(
+        agent_cache=agent_cache,
+        caps=RuntimeCaps(),
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        comment_store=comment_store,
+    )
+
+    config = OIDCConfig(
+        issuer="https://accounts.google.com",
+        client_id="cid",
+        client_secret="secret",
+        redirect_uri="http://localhost:8000/auth/callback",
+        cookie_secret=bytes.fromhex("bb" * 32),
+        scopes="openid email profile",
+        session_ttl_hours=8,
+        logout_redirect_uri=None,
+        allowed_domains=None,
+        provider_type=provider_type,
+        authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+        userinfo_endpoint=None,
+        allow_invites=False,
+    )
+    app = create_app(
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=agent_cache,
+        comment_store=comment_store,
+        permission_store=permission_store,
+        host_store=host_store,
+        auth_provider=UnifiedAuthProvider(source="oidc", oidc_config=config),
+    )
+    with TestClient(app) as client:
+        yield client
+
+
+def test_create_app_mounts_the_grant_under_oidc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mount decision must be exercised through ``create_app`` itself.
+
+    Testing the factory directly proves the router builds; it does not prove
+    the app ever calls it. A typo in the mount condition would silently leave
+    ``/oauth/*`` absent under OIDC with every other test still green.
+    """
+    for client in _build_oidc_app(tmp_path, monkeypatch):
+        res = client.post("/oauth/device/authorize", json={"client_id": "polly"})
+        assert res.status_code == 200, f"/oauth/device/authorize returned {res.status_code}"
+        assert res.json()["user_code"]
+
+
+def test_create_app_refuses_the_grant_for_github_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GitHub is an ``oidc`` source that cannot honour the re-auth gate.
+
+    The app must boot without it rather than mount routes whose security
+    property does not hold.
+    """
+    for client in _build_oidc_app(tmp_path, monkeypatch, provider_type="github"):
+        # Asserted against the route table, not a status code: the SPA
+        # catch-all answers unmounted paths, so "not 200" would also pass if
+        # the routes were mounted and merely erroring.
+        oauth_routes = [
+            route.path
+            for route in client.app.routes  # type: ignore[attr-defined]
+            if getattr(route, "path", "").startswith("/oauth/")
+        ]
+        assert oauth_routes == [], f"the grant must not mount for GitHub OAuth: {oauth_routes}"
+
+
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     yield from _build_accounts_app(tmp_path, monkeypatch)

@@ -138,3 +138,49 @@ def test_re_authentication_still_round_trips_the_return_to(oidc_client: TestClie
     claims = jwt.decode(cookie, _TEST_SECRET, algorithms=["HS256"])
 
     assert unquote(claims["return_to"]) == "/oauth/device?user_code=K7M2-QP9X"
+
+
+# ── The consent page against a REAL OIDCConfig ────────────────────
+
+
+def test_consent_page_renders_for_a_real_oidc_session_cookie(tmp_path: Path) -> None:
+    """A genuine OIDC session must satisfy the consent page's own cookie read.
+
+    ``_session_iat`` reads ``cookie_config.session_cookie_name`` and verifies
+    with ``cookie_config.cookie_secret``. If either diverged from what
+    ``/auth/callback`` actually sets, it would return ``None`` on every
+    request and the consent page would bounce forever — a login loop with no
+    error and no failing test. A hand-built ``SimpleNamespace`` cannot catch
+    that; this drives the real config and the real minting helper.
+    """
+    import time
+
+    from fastapi import FastAPI
+
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.oidc import mint_session_cookie
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    config = _oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+
+    app = FastAPI()
+    app.include_router(create_device_auth_router(provider, store))
+
+    with TestClient(app) as client:
+        res = client.post("/oauth/device/authorize", json={"client_id": "polly"})
+        assert res.status_code == 200, res.text
+        user_code = res.json()["user_code"]
+
+        # A login that happens AFTER the grant, exactly as the forced bounce
+        # would produce.
+        time.sleep(1)
+        session = mint_session_cookie("alice@example.com", config.cookie_secret, 8, "oidc")
+        client.cookies.set(config.session_cookie_name, session)
+
+        page = client.get(f"/oauth/device?user_code={user_code}", follow_redirects=False)
+
+    assert page.status_code == 200, f"consent bounced instead of rendering: {page.headers}"
+    assert "alice@example.com" in page.text, "the consent screen must name the identity"
+    assert "polly" in page.text, "and the client asking for access"
