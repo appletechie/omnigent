@@ -565,7 +565,7 @@ def test_consent_page_requires_login(app: TestClient) -> None:
     """The consent page bounces an unauthenticated visitor to login."""
     r = app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
     assert r.status_code == 302
-    assert "/login" in r.headers["location"]
+    assert r.headers["location"].startswith("/login?"), r.headers["location"]
 
 
 def test_consent_forces_reauth_even_with_no_session_at_all(app: TestClient) -> None:
@@ -604,7 +604,8 @@ def test_consent_forces_reauth_for_stale_session(app: TestClient) -> None:
     r = app.get(f"/oauth/device?user_code={user_code}", follow_redirects=False)
     assert r.status_code == 302, r.text
     loc = r.headers["location"]
-    assert "/login" in loc and "reauth=1" in loc
+    assert loc.startswith("/login?"), loc
+    assert "reauth=1" in loc
 
     # Approve POST refuses the stale session too (defense in depth — a direct
     # POST must not bypass the GET's gate).
@@ -735,7 +736,7 @@ def test_browser_consent_not_gated_by_client_secret(secret_app: TestClient) -> N
     r = secret_app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
     # Bounces to login (unauthenticated), NOT a 401 invalid_client.
     assert r.status_code == 302
-    assert "/login" in r.headers["location"]
+    assert r.headers["location"].startswith("/login?"), r.headers["location"]
 
 
 def test_no_secret_configured_stays_public(app: TestClient) -> None:
@@ -882,3 +883,28 @@ def test_unsupported_reason_refuses_oidc_with_no_config() -> None:
 
     provider = SimpleNamespace(_source="oidc", _oidc_config=None, _accounts_config=None)
     assert unsupported_reason(provider) is not None  # type: ignore[arg-type]
+
+
+def test_bounce_percent_encodes_the_return_to(app: TestClient) -> None:
+    """The consent URL must survive the bounce whatever the code contains.
+
+    ``html.escape`` is an HTML escaper, not a URL one: it leaves ``?``,
+    ``=``, ``#`` and ``+`` untouched. A ``#`` therefore ended the URL and
+    turned everything after it into a fragment, silently truncating the
+    ``return_to`` the user is meant to come back to. Percent-encoding is the
+    correct tool for a query value.
+
+    The ``&reauth=1`` that follows survived only because ``html.escape``
+    happens to turn ``&`` into ``&amp;`` — an accident of the escaper, not a
+    property the forced-re-auth invariant should rest on.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    r = app.get("/oauth/device?user_code=AB%23CD%26reauth=0", follow_redirects=False)
+
+    assert r.status_code == 302
+    query = parse_qs(urlparse(r.headers["location"]).query)
+    assert query["return_to"] == ["/oauth/device?user_code=AB#CD&reauth=0"], (
+        "the consent URL must round-trip intact"
+    )
+    assert query["reauth"] == ["1"], "and the forced re-auth must be the only one"
