@@ -39,6 +39,7 @@ import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
+import { GrokIcon } from "@/components/icons/GrokIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
 import { KiroIcon } from "@/components/icons/KiroIcon";
@@ -499,6 +500,9 @@ function iconForWrapperOrHarness(
   if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
   if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
   if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
+  // Grok Build has no native wrapper, so only the harness names it. Its
+  // canonical id is `grok`, with a `grok-build` alias.
+  if (harness?.includes("grok")) return GrokIcon;
   // Exact match — a substring check would false-match e.g. "openapi".
   if (iconKind === "pi" || harness === "pi") return PiIcon;
   if (isNessie) return NessieIcon;
