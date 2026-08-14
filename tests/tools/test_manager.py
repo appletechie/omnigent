@@ -16,6 +16,7 @@ from omnigent.errors import OmnigentError
 from omnigent.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
+    ExecutorSpec,
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
@@ -30,6 +31,21 @@ from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
+
+
+def test_tool_free_spec_registers_no_automatic_or_declared_tools() -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(config={"tool_free": True}),
+        skills=[SkillSpec(name="review", description="Review.", content="Review it.")],
+        tools=ToolsConfig(agents=["worker"]),
+        sub_agents=[AgentSpec(spec_version=1, name="worker")],
+        spawn=True,
+        async_enabled=True,
+    )
+
+    assert ToolManager(spec).get_tool_schemas() == []
+
 
 # Tools that ToolManager registers unconditionally on every
 # spec these tests construct: the lifecycle ``sys_cancel_task``

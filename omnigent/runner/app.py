@@ -5843,7 +5843,7 @@ def create_runner_app(
                     )
             _session_tool_schemas[conv] = all_tools
 
-        if cached_spec and cached_spec.mcp_servers:
+        if cached_spec and cached_spec.mcp_servers and not cached_spec.tool_free:
             from omnigent.runner.mcp_manager import compute_spec_hash
 
             _mcp_hash = compute_spec_hash(list(cached_spec.mcp_servers))
@@ -5876,7 +5876,11 @@ def create_runner_app(
                     )
 
         _spec_tools = _session_tool_schemas.get(conv) or []
-        _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
+        _client_tools = (
+            []
+            if cached_spec is not None and cached_spec.tool_free
+            else cast(list[_JsonObject], msg_body.get("tools") or [])
+        )
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
             harness_body["tools"] = merged_tools
@@ -6154,7 +6158,11 @@ def create_runner_app(
                         _turn_spec_entry = _resolved_turn_spec
             _turn_spec_resolved = True
             _turn_mcp = ProxyMcpManager(conv_id, server_client)
-            if _eager_spec_error is None and _turn_spec is not None:
+            if (
+                _eager_spec_error is None
+                and _turn_spec is not None
+                and not cast(AgentSpec, _turn_spec).tool_free
+            ):
                 try:
                     _mcp = await _turn_mcp.schemas_for(cast(AgentSpec, _turn_spec))
                     _mcp_schemas = _mcp.schemas
@@ -6232,7 +6240,15 @@ def create_runner_app(
                 return
 
             event_body = _wrap_as_message_event(body)
-            _inject_mcp_schemas(event_body, _mcp_schemas)
+            event_spec = (
+                _unwrap_resolved_spec((await _resolve_turn_spec_lazy())[0])
+                if event_body.get("tools") or _mcp_schemas
+                else None
+            )
+            if event_spec is not None and event_spec.tool_free:
+                event_body.pop("tools", None)
+            else:
+                _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             try:
                 async with client.stream(

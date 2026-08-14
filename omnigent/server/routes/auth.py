@@ -46,6 +46,9 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# The signed state records a server timestamp while the IdP attests auth_time.
+# Permit only the existing bounded clock skew between them.
+_REAUTH_PROCESSING_ALLOWANCE_SECONDS = 120
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -163,6 +166,7 @@ def create_auth_router(
         # before the callback redeems it. Only meaningful when invites
         # are enabled; ignored otherwise.
         invite = request.query_params.get("invite") if _invites_enabled else None
+        reauth = request.query_params.get("reauth") == "1" and config.provider_type == "oidc"
 
         # Store state + code_verifier in a short-lived signed cookie.
         state_payload: dict[str, str | int] = {
@@ -175,6 +179,8 @@ def create_auth_router(
             state_payload["ticket"] = ticket
         if invite:
             state_payload["invite"] = invite
+        if reauth:
+            state_payload["reauth_at"] = int(time.time())
         state_jwt = jwt.encode(state_payload, config.cookie_secret, algorithm="HS256")
 
         # Build the authorization URL.
@@ -187,6 +193,9 @@ def create_auth_router(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
+        if reauth:
+            params["prompt"] = "login"
+            params["max_age"] = "0"
         auth_url = config.authorization_endpoint + "?" + urlencode(params)
 
         response = RedirectResponse(url=auth_url, status_code=302)
@@ -264,6 +273,7 @@ def create_auth_router(
             "code_verifier": code_verifier,
         }
 
+        proven_at: int | None = None
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
             # response from the token endpoint.
@@ -302,7 +312,15 @@ def create_auth_router(
                     access_token if isinstance(access_token, str) else "",
                 )
             else:
-                email = _resolve_oidc_email(token_json, config)
+                verified_claims = _verified_id_token_claims(token_json, config)
+                email = _resolve_oidc_email_from_verified_claims(verified_claims, config)
+                if state_payload.get("reauth_at") is not None:
+                    if not _idp_reauthenticated(verified_claims, state_payload.get("reauth_at")):
+                        return JSONResponse(
+                            status_code=403,
+                            content={"error": "Re-authentication was required but did not occur"},
+                        )
+                    proven_at = int(time.time())
 
         if not email:
             return JSONResponse(
@@ -359,6 +377,7 @@ def create_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
+            auth_time=proven_at,
         )
 
         # Check if this callback fulfills a CLI login ticket.
@@ -767,6 +786,42 @@ def _claim_is_verified_true(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
+def _verified_id_token_claims(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+) -> dict[str, object] | None:
+    """Validate an OIDC ID token and return only its verified claims."""
+    id_token = token_json.get("id_token")
+    if not isinstance(id_token, str) or not id_token:
+        return None
+    if config.jwks_uri is None:
+        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
+        return None
+    try:
+        signing_key = jwt.PyJWKClient(config.jwks_uri).get_signing_key_from_jwt(id_token)
+        claims: dict[str, object] = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            audience=config.client_id,
+            issuer=config.issuer,
+        )
+    except jwt.InvalidTokenError as exc:
+        _logger.warning("id_token validation failed: %s", exc)
+        return None
+    return claims
+
+
+def _idp_reauthenticated(verified_claims: dict[str, object] | None, reauth_at: object) -> bool:
+    """Return whether the IdP attests authentication after signed reauth demand."""
+    if verified_claims is None or not isinstance(reauth_at, int):
+        return False
+    auth_time = verified_claims.get("auth_time")
+    return isinstance(auth_time, int) and auth_time >= (
+        reauth_at - _REAUTH_PROCESSING_ALLOWANCE_SECONDS
+    )
+
+
 def _resolve_oidc_email(
     token_json: dict[str, object],
     config: OIDCConfig,
@@ -805,28 +860,21 @@ def _resolve_oidc_email(
         ``email_verified`` is not truthy (and verification is not
         skipped via config).
     """
-    id_token = token_json.get("id_token")
-    if not isinstance(id_token, str) or not id_token:
-        return None
-    if config.jwks_uri is None:
-        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
+    return _resolve_oidc_email_from_verified_claims(
+        _verified_id_token_claims(token_json, config),
+        config,
+    )
+
+
+def _resolve_oidc_email_from_verified_claims(
+    verified_claims: dict[str, object] | None,
+    config: OIDCConfig,
+) -> str | None:
+    """Resolve an email from claims already verified by the OIDC boundary."""
+    if verified_claims is None:
         return None
 
-    try:
-        jwks_client = jwt.PyJWKClient(config.jwks_uri)
-        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
-        claims = jwt.decode(
-            id_token,
-            signing_key.key,
-            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
-            audience=config.client_id,
-            issuer=config.issuer,
-        )
-    except jwt.InvalidTokenError as exc:
-        _logger.warning("id_token validation failed: %s", exc)
-        return None
-
-    email = claims.get(config.email_claim)
+    email = verified_claims.get(config.email_claim)
     if not isinstance(email, str) or not email.strip():
         _logger.warning(
             "Rejecting id_token: %r claim is missing or not a non-empty string "
@@ -834,7 +882,7 @@ def _resolve_oidc_email(
             "IdPs that use a different claim for the email identity "
             "can set OMNIGENT_OIDC_EMAIL_CLAIM.",
             config.email_claim,
-            sorted(claims.keys()),
+            sorted(verified_claims.keys()),
         )
         return None
     email = email.strip()
@@ -867,7 +915,7 @@ def _resolve_oidc_email(
     # Absent/false ``email_verified`` is a hard reject — unless the
     # operator opted out (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION) for
     # IdPs like Okta that omit the claim for directory-managed users.
-    if not _claim_is_verified_true(claims.get("email_verified")):
+    if not _claim_is_verified_true(verified_claims.get("email_verified")):
         if config.skip_email_verification:
             _logger.info(
                 "Accepting id_token email %r without email_verified "

@@ -79,6 +79,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_PERMISSION_MODE", "acceptEdits")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_TOOL_FREE", "1")
 
     captured: dict[str, Any] = {}
 
@@ -95,6 +96,7 @@ def test_executor_factory_reads_env_vars(
         base_url_override: str | None,
         gateway_auth_command: str | None,
         gateway_auth_refresh_interval_ms: str | None,
+        tool_free: bool,
         **_kwargs: Any,
     ) -> None:
         captured["cwd"] = cwd
@@ -107,6 +109,7 @@ def test_executor_factory_reads_env_vars(
         captured["base_url_override"] = base_url_override
         captured["gateway_auth_command"] = gateway_auth_command
         captured["gateway_auth_refresh_interval_ms"] = gateway_auth_refresh_interval_ms
+        captured["tool_free"] = tool_free
 
     with patch(
         "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
@@ -125,6 +128,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["gateway_auth_refresh_interval_ms"] == "900000"
     assert captured["cwd"] == "/tmp/test-cwd"
     assert captured["permission_mode"] == "acceptEdits"
+    assert captured["tool_free"] is True
     # When ``HARNESS_CLAUDE_SDK_OS_ENV`` is unset (this test
     # doesn't set it), the wrap defaults to ``caller_process +
     # sandbox=none`` so the SDK exposes its native tools to the

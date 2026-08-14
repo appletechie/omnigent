@@ -21,10 +21,10 @@ Endpoints (all mounted at the app root):
   returns delegated access + refresh tokens.
 - ``POST /oauth/revoke`` — revoke a grant (backs client logout).
 
-Mounted only in ``accounts`` auth mode (and only when
-``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). OIDC deployments delegate login
-to the IdP via the cli-ticket flow (``/auth/cli-login``) and never use this
-grant; header mode has no server-mintable identity.
+Mounted in Accounts and full-OIDC auth modes when
+``OMNIGENT_DEVICE_GRANT_ENABLED`` is set. GitHub OAuth cannot attest a forced
+reauthentication, and header mode has no server-mintable identity, so neither
+can carry this grant.
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.
 
@@ -53,6 +53,7 @@ import logging
 import os
 import secrets
 import time
+from urllib.parse import quote
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
@@ -257,23 +258,41 @@ class _SlidingWindowRateLimiter:
         return True
 
 
+def unsupported_reason(auth_provider: UnifiedAuthProvider) -> str | None:
+    """Return why an auth provider cannot safely carry a device grant."""
+    if auth_provider._source not in ("accounts", "oidc"):
+        return f"{auth_provider._source!r} auth has no server-minted session to delegate from"
+    if auth_provider._source == "oidc":
+        config = auth_provider._oidc_config
+        if config is None:
+            return "oidc auth is selected but no OIDC config is present"
+        if config.provider_type != "oidc":
+            return (
+                f"{config.provider_type!r} is not full OIDC, so it cannot force and attest "
+                "reauthentication"
+            )
+    return None
+
+
 def create_device_auth_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
-    :param auth_provider: The active provider. Must be ``accounts`` mode;
-        its cookie config supplies the HMAC signing key and public base URL.
+    :param auth_provider: The active Accounts or full-OIDC provider.
     :param device_grant_store: Persistence for device grants.
     :returns: APIRouter to mount at the app root.
     """
-    if auth_provider._source != "accounts":
-        raise RuntimeError(
-            f"create_device_auth_router requires accounts auth (got {auth_provider._source!r})"
-        )
-    cookie_config = auth_provider._accounts_config
-    assert cookie_config is not None, "accounts mode must have an accounts config"
+    reason = unsupported_reason(auth_provider)
+    if reason is not None:
+        raise RuntimeError(f"create_device_auth_router cannot build: {reason}")
+    cookie_config = (
+        auth_provider._oidc_config
+        if auth_provider._source == "oidc"
+        else auth_provider._accounts_config
+    )
+    assert cookie_config is not None, f"{auth_provider._source} mode must have a cookie config"
     cookie_secret = cookie_config.cookie_secret
     base_url = cookie_config.base_url
     provider_name = auth_provider._source
@@ -389,28 +408,15 @@ def create_device_auth_router(
 
     # ── Browser consent page ──────────────────────────────────────
 
-    def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
-        """302 to the login page, returning to this consent URL afterward.
-
-        ``reauth`` adds ``&reauth=1`` so the login page forces a fresh
-        password submit instead of auto-bouncing an already-signed-in user
-        (which would loop back here with the same stale session).
-        """
+    def _bounce_to_login(user_code: str) -> RedirectResponse:
+        """Force login, then return to this consent URL."""
         login_url = auth_provider.login_url or "/login"
         return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
-        query = f"return_to={html.escape(return_to, quote=True)}"
-        if reauth:
-            query += "&reauth=1"
+        query = f"return_to={quote(return_to, safe='/')}&reauth=1"
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
-    def _session_iat(request: Request) -> int | None:
-        """Return the ``iat`` (issue time) of the caller's session JWT.
-
-        Read from the session cookie (accounts mode mints a fresh ``iat``
-        on every ``/auth/login``, so this is effectively the last-login
-        time). ``None`` when absent/invalid. Used to enforce that consent
-        follows a login started FOR this device flow.
-        """
+    def _session_auth_time(request: Request) -> int | None:
+        """Return when the session owner last proved their identity."""
         token = request.cookies.get(cookie_config.session_cookie_name)
         if not token:
             return None
@@ -418,8 +424,8 @@ def create_device_auth_router(
             payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        iat = payload.get("iat")
-        return iat if isinstance(iat, int) else None
+        auth_time = payload.get("auth_time")
+        return auth_time if isinstance(auth_time, int) else None
 
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
@@ -431,8 +437,8 @@ def create_device_auth_router(
         Omnigent identity being delegated and the requesting ``client_id``
         so any mismatch is visible before approval.
 
-        **Re-authentication:** consent requires a login performed AFTER this
-        device flow began (session ``iat`` ≥ the grant's ``created_at``). A
+        **Re-authentication:** consent requires proof performed AFTER this
+        device flow began (session ``auth_time`` ≥ the grant's ``created_at``). A
         pre-existing session — however recent — is bounced back through the
         login page with ``reauth=1``, so approving a device grant always
         costs a deliberate, fresh password entry. This closes the
@@ -443,7 +449,7 @@ def create_device_auth_router(
         user_id = auth_provider.get_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
         if user_id is None:
-            return _bounce_to_login(user_code, reauth=False)
+            return _bounce_to_login(user_code)
 
         if not user_code:
             return HTMLResponse(_consent_html(prompt_for_code=True), status_code=200)
@@ -456,13 +462,11 @@ def create_device_auth_router(
                 status_code=200,
             )
 
-        # Force a fresh login when the current session predates this grant:
-        # only a login started for THIS flow (iat ≥ the grant's created_at)
-        # may approve. Bounce with reauth=1 so the login page re-prompts
-        # rather than auto-returning the stale session (which would loop).
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
-            return _bounce_to_login(user_code, reauth=True)
+        # Only a credential proven for this flow may approve it. Bounce with
+        # reauth=1 so the login path re-prompts instead of reusing a session.
+        session_auth_time = _session_auth_time(request)
+        if session_auth_time is None or session_auth_time < grant.created_at:
+            return _bounce_to_login(user_code)
 
         return HTMLResponse(
             _consent_html(
@@ -496,11 +500,9 @@ def create_device_auth_router(
                 status_code=200,
             )
 
-        # Re-auth gate, enforced here too (not just on the consent GET): a
-        # stale session must not approve by POSTing directly. Only a login
-        # started for THIS flow (session iat ≥ the grant's created_at) passes.
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        # Enforce the proof on POST too so a direct request cannot bypass GET.
+        session_auth_time = _session_auth_time(request)
+        if session_auth_time is None or session_auth_time < grant.created_at:
             return HTMLResponse(
                 _consent_html(
                     error="Your session is too old to approve this login. "
@@ -647,9 +649,16 @@ def create_device_auth_router(
             max_lifetime_seconds=_GRANT_MAX_LIFETIME_SECONDS,
         )
         if rotated is None:
-            # Lost a concurrent rotation race, or the grant aged out between
-            # the check above and here — reject without revoking (this is not
-            # a reuse signal, so the grant must not be killed/oscillate).
+            # A CAS loser might have raced another holder of this same token.
+            # Recheck after the failed update: a now-previous digest is reuse
+            # and must revoke the winner's freshly-issued token. If it is not
+            # previous, this was an age-out/mismatch and must not revoke.
+            stale = device_grant_store.get_by_prev_refresh_hash(presented_hash)
+            if stale is not None and stale.id == grant.id:
+                device_grant_store.revoke(stale.id)
+                _logger.warning(
+                    "oauth/token: refresh reuse detected on grant %s — revoked", stale.id
+                )
             return _oauth_error("invalid_grant")
         if rotated.user_id is None:
             return _oauth_error("invalid_grant")

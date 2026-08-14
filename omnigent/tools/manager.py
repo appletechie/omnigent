@@ -154,6 +154,8 @@ class ToolManager:
         # ``shutdown`` can close it cleanly. ``None`` when the spec
         # didn't declare ``os_env``.
         self._os_env: OSEnvironment | None = None
+        if spec.tool_free:
+            return
         self._register_skill_tools()
         self._register_builtin_tools()
         self._register_sub_agent_tools()

@@ -828,7 +828,7 @@ def _populate_codex_home_config(
             # its timeout. auth.json alone cannot supply these provider tables.
             source_config = tomlkit.parse(source_file.read_text())
             minimal_document = tomlkit.document()
-            for key in ("model_provider", "model_providers", "profiles"):
+            for key in ("model_provider", "model_providers", "profile", "profiles"):
                 if key in source_config:
                     minimal_document[key] = source_config[key]
             dest_path.write_text(tomlkit.dumps(minimal_document))
@@ -1238,6 +1238,7 @@ _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     CODEX_EXTENDED_CATALOG_ENV_VAR,
+    _CODEX_MINIMAL_CONFIG_ENV,
 )
 
 
@@ -2056,8 +2057,13 @@ class _CodexAppServerSession:
         if self._started:
             return
         self._loop = asyncio.get_running_loop()
+        minimal_config = self._env.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         codex_home_root = Path(tempfile.gettempdir())
-        if self._cwd and self._cwd != "/":
+        if not minimal_config and self._cwd and self._cwd != "/":
             try:
                 codex_home_root = Path(self._cwd) / ".codex-tmp"
                 codex_home_root.mkdir(parents=True, exist_ok=True)
@@ -2094,7 +2100,7 @@ class _CodexAppServerSession:
         # hooks instead of being symlinked in untouched. Only an auto-harness
         # Smart Routing session gets that endpoint, so a plain or pinned session
         # keeps the symlink — and with it mid-session edits to the user's file.
-        router_bridge_dir = codex_router_bridge_dir(self._env)
+        router_bridge_dir = None if minimal_config else codex_router_bridge_dir(self._env)
         if router_bridge_dir is not None:
             # Probed only on the routing path so a plain session never pays the
             # subprocess. A CLI too old for the spawn gate drops the hooks and
@@ -2112,6 +2118,7 @@ class _CodexAppServerSession:
             _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
+            minimal_config=minimal_config,
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
         )
@@ -2345,11 +2352,25 @@ class _CodexAppServerSession:
             }
             if system_prompt:
                 params["developerInstructions"] = system_prompt
+            features: CodexParams = {}
             if tools:
                 params["dynamicTools"] = _dynamic_tool_specs(tools)
-                features: CodexParams = {"unified_exec": False}
-                if self._disable_native_tools:
-                    features["shell_tool"] = False
+                features["unified_exec"] = False
+            if self._disable_native_tools:
+                features.update(
+                    {
+                        "unified_exec": False,
+                        "shell_tool": False,
+                        "apps": False,
+                        "browser_use": False,
+                        "computer_use": False,
+                        "image_generation": False,
+                        "multi_agent": False,
+                        "tool_search": False,
+                        "view_image": False,
+                    }
+                )
+            if features:
                 params["config"] = {"features": features}
             response = await self._request("thread/start", params)
             thread = response.get("result", {}).get("thread", {})

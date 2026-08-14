@@ -1,0 +1,19 @@
+spec_version: 1
+name: codex_review
+description: Tool-free Codex reviewer for an uploaded pull-request diff.
+spawn: false
+async: false
+skills: none
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+    tool_free: true
+    disable_native_tools: true
+    enable_web_search: false
+    minimal_config: true
+
+prompt: |
+  Review only the supplied diff. Do not request repository access or take
+  actions. Return only JSON matching the schema in the task.

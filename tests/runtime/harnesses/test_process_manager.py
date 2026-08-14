@@ -512,6 +512,60 @@ async def test_get_client_respawns_on_model_change(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("config_key", "first_value", "safe_value"),
+    [
+        ("HARNESS_TEST_SKILLS_FILTER", '"all"', '"none"'),
+        ("HARNESS_TEST_DISABLE_NATIVE_TOOLS", "0", "1"),
+        ("HARNESS_TEST_ENABLE_WEB_SEARCH", "1", "0"),
+        ("HARNESS_TEST_MINIMAL_CONFIG", "0", "1"),
+        ("HARNESS_TEST_TOOL_FREE", "0", "1"),
+    ],
+)
+async def test_get_client_respawns_on_safety_config_change_only(
+    manager: HarnessProcessManager,
+    config_key: str,
+    first_value: str,
+    safe_value: str,
+) -> None:
+    """Same-harness agent switches replace stale safety config, not unrelated env."""
+    await manager.start()
+    try:
+        client_first = await manager.get_client(
+            "conv_safety_switch",
+            _TEST_HARNESS_NAME,
+            env={
+                config_key: first_value,
+                "HARNESS_TEST_CUSTOM": "first",
+            },
+        )
+        pid_first = (await client_first.get("/pid")).json()["pid"]
+
+        client_irrelevant = await manager.get_client(
+            "conv_safety_switch",
+            _TEST_HARNESS_NAME,
+            env={
+                config_key: first_value,
+                "HARNESS_TEST_CUSTOM": "second",
+            },
+        )
+        assert (await client_irrelevant.get("/pid")).json()["pid"] == pid_first
+
+        client_safe = await manager.get_client(
+            "conv_safety_switch",
+            _TEST_HARNESS_NAME,
+            env={
+                config_key: safe_value,
+                "HARNESS_TEST_CUSTOM": "third",
+            },
+        )
+        pid_safe = (await client_safe.get("/pid")).json()["pid"]
+        assert pid_safe != pid_first
+        assert (await client_safe.get(f"/env/{config_key}")).json() == {"value": safe_value}
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_any_harness_sentinel_reuses_subprocess(
     manager: HarnessProcessManager,
 ) -> None:

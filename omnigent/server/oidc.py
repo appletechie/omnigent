@@ -55,6 +55,8 @@ def mint_session_token(
     cookie_secret: bytes,
     ttl_seconds: int,
     provider: str,
+    *,
+    auth_time: int | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -71,15 +73,20 @@ def mint_session_token(
     :param ttl_seconds: Token lifetime in seconds.
     :param provider: Identity provider name, e.g. ``"google"`` or
         ``"accounts"``. Stored as an informational claim.
+    :param auth_time: When the user last proved their identity. Kept separate
+        from token issuance because an OIDC callback can silently reuse an IdP
+        session. Omitted when no fresh authentication was attested.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
-    payload = {
+    payload: dict[str, object] = {
         "sub": user_id,
         "iat": now,
         "exp": now + ttl_seconds,
         "provider": provider,
     }
+    if auth_time is not None:
+        payload["auth_time"] = auth_time
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -88,6 +95,8 @@ def mint_session_cookie(
     cookie_secret: bytes,
     ttl_hours: int,
     provider: str,
+    *,
+    auth_time: int | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -97,9 +106,16 @@ def mint_session_cookie(
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
+    :param auth_time: See :func:`mint_session_token`.
     :returns: An HS256-signed JWT string.
     """
-    return mint_session_token(user_id, cookie_secret, ttl_hours * 3600, provider)
+    return mint_session_token(
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        auth_time=auth_time,
+    )
 
 
 def hmac_digest(token: str, secret: bytes) -> str:

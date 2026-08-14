@@ -17,13 +17,23 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
+import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from jwt.algorithms import RSAAlgorithm
 
+from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.oidc import OIDCConfig
 
 _KEY = b"k" * 32
 
@@ -31,19 +41,112 @@ _KEY = b"k" * 32
 # ── Router mount guard (unit) ─────────────────────────────────────
 
 
-@pytest.mark.parametrize("source", ["oidc", "header"])
-def test_router_factory_rejects_non_accounts_mode(source: str, tmp_path: Path) -> None:
-    """The device grant is accounts-mode only. OIDC delegates login to the IdP
-    (cli-ticket flow) and never uses these routes; header can't mint identity.
-    ``create_device_auth_router`` must refuse to build for either."""
+def test_router_factory_rejects_header_mode(tmp_path: Path) -> None:
+    """Header auth cannot safely mint a delegated browser identity."""
     from types import SimpleNamespace
 
     from omnigent.server.routes.device_auth import create_device_auth_router
 
-    provider = SimpleNamespace(_source=source)
+    provider = SimpleNamespace(_source="header")
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
-    with pytest.raises(RuntimeError, match="accounts"):
+    with pytest.raises(RuntimeError, match="no server-minted session"):
         create_device_auth_router(provider, store)  # type: ignore[arg-type]
+
+
+def test_router_factory_rejects_github_oauth(tmp_path: Path) -> None:
+    """GitHub OAuth cannot attest a forced OIDC reauthentication."""
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    config = replace(_oidc_config(), provider_type="github")
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    with pytest.raises(RuntimeError, match="not full OIDC"):
+        create_device_auth_router(provider, store)
+
+
+def _oidc_config() -> OIDCConfig:
+    return OIDCConfig(
+        issuer="https://accounts.google.com",
+        client_id="test-client",
+        client_secret="test-secret",
+        redirect_uri="http://localhost:8000/auth/callback",
+        cookie_secret=_KEY,
+        scopes="openid email profile",
+        session_ttl_hours=8,
+        logout_redirect_uri=None,
+        allowed_domains=None,
+        provider_type="oidc",
+        authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+        token_endpoint="https://oauth2.googleapis.com/token",
+        jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+        userinfo_endpoint=None,
+        allow_invites=False,
+    )
+
+
+def test_oidc_router_allows_reauthenticated_browser_to_approve(tmp_path: Path) -> None:
+    """A verified OIDC browser identity can bind a pending device grant."""
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    config = _oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    api = FastAPI()
+    api.include_router(create_device_auth_router(provider, store))
+
+    with TestClient(api) as client:
+        started = client.post("/oauth/device/authorize", json={"client_id": "polly"})
+        assert started.status_code == 200, started.text
+        user_code = started.json()["user_code"]
+        now = int(time.time())
+        session = jwt.encode(
+            {
+                "sub": "alice@example.com",
+                "iat": now - 3600,
+                "auth_time": now,
+                "exp": now + 3600,
+                "provider": "oidc",
+            },
+            config.cookie_secret,
+            algorithm="HS256",
+        )
+        client.cookies.set(config.session_cookie_name, session)
+
+        approved = client.post(
+            "/oauth/device/approve",
+            data={"user_code": user_code},
+            headers={"Origin": "http://localhost:8000"},
+        )
+
+    assert approved.status_code == 200, approved.text
+    assert "Connected" in approved.text
+    assert store.get_by_user_code(user_code).user_id == "alice@example.com"
+
+
+def test_login_bounce_is_forced_and_percent_encodes_return_target(tmp_path: Path) -> None:
+    """Every OIDC bounce forces login and keeps the consent URL in one value."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/dg.db")
+    api = FastAPI()
+    api.include_router(create_device_auth_router(provider, store))
+
+    with TestClient(api) as client:
+        response = client.get(
+            "/oauth/device?user_code=ABCD%3Frole%3Dadmin%23fragment",
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 302
+    location = response.headers["location"]
+    assert "%3F" in location and "%3D" in location and "%23" in location
+    assert parse_qs(urlsplit(location).query) == {
+        "return_to": ["/oauth/device?user_code=ABCD?role=admin#fragment"],
+        "reauth": ["1"],
+    }
 
 
 # ── Store invariants (unit) ───────────────────────────────────────
@@ -174,6 +277,88 @@ def test_refresh_refused_past_absolute_lifetime(store: DeviceGrantStore) -> None
     assert store.is_revoked(g.id) is False
 
 
+def test_refresh_cas_loser_reuse_revokes_winner_token(
+    store: DeviceGrantStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotation CAS loser rechecks r1 and revokes the winner's r2."""
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    now = int(time.time())
+    grant = _new_grant(store, now=now)
+    store.approve(grant.id, user_id="a@x", now_epoch_seconds=now + 1)
+    store.redeem_approved(
+        grant.id, refresh_token_hash=hash_secret("r1", _KEY), now_epoch_seconds=now + 2
+    )
+    rotate = store.rotate_refresh_token
+
+    def lose_race(*args: object, **kwargs: object) -> None:
+        winner = rotate(
+            grant.id,
+            expected_hash=hash_secret("r1", _KEY),
+            new_hash=hash_secret("r2", _KEY),
+            now_epoch_seconds=now + 3,
+            max_lifetime_seconds=_LIFETIME,
+        )
+        assert winner is not None
+
+    monkeypatch.setattr(store, "rotate_refresh_token", lose_race)
+    api = FastAPI()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+    api.include_router(create_device_auth_router(provider, store))
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "r1"}
+        )
+        monkeypatch.setattr(store, "rotate_refresh_token", rotate)
+        winner_token = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "r2"}
+        )
+
+    assert response.status_code == 400 and response.json()["error"] == "invalid_grant"
+    assert winner_token.status_code == 400 and winner_token.json()["error"] == "invalid_grant"
+    assert store.is_revoked(grant.id) is True
+
+
+def test_refresh_age_out_during_rotation_does_not_revoke(
+    store: DeviceGrantStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed rotation from grant age-out is not refresh-token reuse."""
+    from omnigent.server.routes.device_auth import create_device_auth_router
+
+    grant = _new_grant(store)
+    approved_at = int(time.time()) - _LIFETIME + 10
+    store.approve(grant.id, user_id="a@x", now_epoch_seconds=approved_at)
+    store.redeem_approved(
+        grant.id,
+        refresh_token_hash=hash_secret("r1", _KEY),
+        now_epoch_seconds=approved_at + 1,
+    )
+    rotate = store.rotate_refresh_token
+
+    def age_out(*args: object, **kwargs: object) -> object:
+        return rotate(
+            grant.id,
+            expected_hash=hash_secret("r1", _KEY),
+            new_hash=hash_secret("r2", _KEY),
+            now_epoch_seconds=approved_at + _LIFETIME,
+            max_lifetime_seconds=_LIFETIME,
+        )
+
+    monkeypatch.setattr(store, "rotate_refresh_token", age_out)
+    api = FastAPI()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+    api.include_router(create_device_auth_router(provider, store))
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": "r1"}
+        )
+
+    assert response.status_code == 400 and response.json()["error"] == "invalid_grant"
+    assert store.is_revoked(grant.id) is False
+
+
 def test_purge_reclaims_aged_redeemed_grants(store: DeviceGrantStore) -> None:
     """purge_expired removes redeemed grants past their absolute lifetime."""
     g = _new_grant(store)
@@ -205,7 +390,11 @@ def test_revoke_is_fail_closed(store: DeviceGrantStore) -> None:
 
 
 def _build_accounts_app(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, device_grant_enabled: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device_grant_enabled: bool = True,
+    auth_provider: UnifiedAuthProvider | None = None,
 ) -> Iterator[TestClient]:
     monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -257,7 +446,7 @@ def _build_accounts_app(
         artifact_store=artifact_store,
         comment_store=comment_store,
     )
-    auth_provider = create_auth_provider()
+    auth_provider = auth_provider or create_auth_provider()
     account_store = SqlAlchemyAccountStore(db_url)
     app = create_app(
         agent_store=agent_store,
@@ -280,9 +469,105 @@ def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]
     yield from _build_accounts_app(tmp_path, monkeypatch)
 
 
+@pytest.fixture
+def oidc_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+    yield from _build_accounts_app(tmp_path, monkeypatch, auth_provider=provider)
+
+
 def _login_admin(client: TestClient) -> None:
     r = client.post("/auth/login", json={"username": "admin", "password": "admin-pw-12345"})
     assert r.status_code == 200, r.text
+
+
+def test_oidc_app_mounts_device_routes(oidc_app: TestClient) -> None:
+    """The production app mounts the opted-in device router for OIDC."""
+    response = oidc_app.post("/oauth/device/authorize", json={"client_id": "polly"})
+    assert response.status_code == 200, response.text
+
+
+def _complete_oidc_callback(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    user_code: str,
+    *,
+    reauth: bool,
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    signing_key = jwt.PyJWK.from_json(RSAAlgorithm.to_jwk(private_key.public_key()))
+    now = int(time.time())
+    id_token = jwt.encode(
+        {
+            "iss": _oidc_config().issuer,
+            "aud": _oidc_config().client_id,
+            "sub": "idp-user",
+            "email": "alice@example.com",
+            "email_verified": True,
+            "iat": now,
+            "auth_time": now,
+            "exp": now + 300,
+        },
+        private_key,
+        algorithm="RS256",
+    )
+
+    async def token_exchange(*args: object, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": id_token})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", token_exchange)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: signing_key,
+    )
+    params = {"return_to": f"/oauth/device?user_code={user_code}"}
+    if reauth:
+        params["reauth"] = "1"
+    login = client.get("/auth/login", params=params, follow_redirects=False)
+    state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": state},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302, callback.text
+
+
+def test_ordinary_oidc_callback_cannot_approve_device_grant(
+    oidc_app: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attacker-selected unforced login cannot manufacture consent proof."""
+    started = oidc_app.post("/oauth/device/authorize", json={"client_id": "polly"})
+    user_code = started.json()["user_code"]
+    _complete_oidc_callback(oidc_app, monkeypatch, user_code, reauth=False)
+
+    approved = oidc_app.post(
+        "/oauth/device/approve",
+        data={"user_code": user_code},
+        headers={"Origin": "http://localhost:8000"},
+    )
+
+    assert "Connected" not in approved.text
+    assert "too old" in approved.text.lower()
+
+
+def test_forced_oidc_callback_can_approve_device_grant(
+    oidc_app: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real login/callback path carries verified proof into approval."""
+    started = oidc_app.post("/oauth/device/authorize", json={"client_id": "polly"})
+    user_code = started.json()["user_code"]
+    _complete_oidc_callback(oidc_app, monkeypatch, user_code, reauth=True)
+
+    approved = oidc_app.post(
+        "/oauth/device/approve",
+        data={"user_code": user_code},
+        headers={"Origin": "http://localhost:8000"},
+    )
+
+    assert "Connected" in approved.text
 
 
 def test_full_device_flow(app: TestClient) -> None:

@@ -165,9 +165,10 @@ WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_POLLY_REVIEW_AGENT_NAME = "polly-review"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
-# polly's and debby's multi-file bundles are packaged under
+# The shipped multi-file example bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
 # seeder is a safety net.
@@ -175,6 +176,9 @@ _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+_POLLY_REVIEW_BUNDLE_SOURCE = resolve_repo_symlink(
+    Path(_examples_resources.__file__).parent / "polly_review"
+)
 
 
 class _FastAPICallNext(Protocol):
@@ -479,6 +483,7 @@ def _ensure_default_agents(
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_polly_review_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -735,6 +740,39 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+
+
+def _build_polly_review_bundle() -> bytes:
+    """Build the packaged ``polly-review`` agent bundle."""
+    import tempfile
+
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(_POLLY_REVIEW_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_polly_review_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register the packaged, fixed Polly Review agent when available."""
+    if not (_POLLY_REVIEW_BUNDLE_SOURCE / "config.yaml").is_file():
+        _logger.debug(
+            "polly-review bundle not found at %s; skipping seed",
+            _POLLY_REVIEW_BUNDLE_SOURCE,
+        )
+        return
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_POLLY_REVIEW_AGENT_NAME,
+        bundle_bytes=_build_polly_review_bundle(),
     )
 
 
@@ -2559,17 +2597,17 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
-        # login to the IdP (cli-ticket flow), so it neither needs nor mounts
-        # these routes. Wires the revocation lookup into the auth provider so
+        # OMNIGENT_DEVICE_GRANT_ENABLED, under Accounts or full OIDC. Wires
+        # the revocation lookup into the auth provider so
         # revoking a grant immediately rejects its delegated access tokens.
         # See designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
+        from omnigent.server.routes.device_auth import unsupported_reason
 
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source == "accounts"
+            and unsupported_reason(auth_provider) is None
             and permission_store is not None
         ):
             from omnigent.server.device_grant_store import DeviceGrantStore

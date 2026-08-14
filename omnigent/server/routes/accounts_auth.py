@@ -299,6 +299,7 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            auth_time=now,
         )
 
         user = account_store.get_user(username)
@@ -446,6 +447,7 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            auth_time=now,
         )
         resp = JSONResponse(
             status_code=200,
@@ -545,6 +547,7 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            auth_time=now,
         )
         resp = JSONResponse(
             status_code=200,
@@ -631,6 +634,7 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            auth_time=now,
         )
         resp = RedirectResponse(url="/", status_code=302)
         _set_session_cookie(

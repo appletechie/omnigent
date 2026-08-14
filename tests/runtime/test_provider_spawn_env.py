@@ -69,6 +69,7 @@ def _clear_ambient_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DATABRICKS_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("omnigent.onboarding.harness_install._LOGIN_PROBE_CACHE", {})
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_catalog_default_model",
         lambda provider_name, family, *, context: _CATALOG_DEFAULTS[(provider_name, family)],
@@ -117,6 +118,7 @@ def _make_spec(
     use_responses: object | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
     os_env: object | None = None,
+    executor_config: dict[str, object] | None = None,
 ) -> AgentSpec:
     """
     Build a minimal :class:`AgentSpec` for a given harness.
@@ -139,6 +141,8 @@ def _make_spec(
         config["profile"] = profile
     if use_responses is not None:
         config["use_responses"] = use_responses
+    if executor_config is not None:
+        config.update(executor_config)
     return AgentSpec(
         spec_version=1,
         name=f"test-{harness}",
@@ -322,6 +326,67 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_MODEL"] == "gpt-default-model"
     # Codex defaults to the Responses wire API when the family omits wire_api.
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+
+
+def test_codex_threads_native_tool_and_web_search_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-agent Codex safety switches reach the isolated harness process."""
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.codex_config_provider_dismissed", lambda _c: False
+    )
+    monkeypatch.setattr("omnigent.runtime.workflow._apply_harness_path_override", lambda *_a: None)
+    spec = _make_spec(
+        harness="codex",
+        auth=ApiKeyAuth(api_key="sk-test"),
+        executor_config={"disable_native_tools": True, "enable_web_search": False},
+    )
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "1"
+    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "0"
+
+
+def test_claude_threads_tool_free_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr("omnigent.runtime.workflow._apply_harness_path_override", lambda *_a: None)
+    spec = _make_spec(
+        harness="claude-sdk",
+        auth=ApiKeyAuth(api_key="sk-test"),
+        executor_config={"tool_free": True},
+    )
+
+    env = _build_claude_sdk_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CLAUDE_SDK_TOOL_FREE"] == "1"
+
+
+def test_codex_threads_minimal_config_for_isolated_reviewer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reviewer can request the executor's hermetic Codex home."""
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.codex_config_provider_dismissed", lambda _c: False
+    )
+    monkeypatch.setattr("omnigent.runtime.workflow._apply_harness_path_override", lambda *_a: None)
+    spec = _make_spec(
+        harness="codex",
+        auth=ApiKeyAuth(api_key="sk-test"),
+        executor_config={"minimal_config": True},
+    )
+
+    env = _build_codex_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_CODEX_MINIMAL_CONFIG"] == "1"
 
 
 def test_codex_falls_back_to_first_available_openai_credential(

@@ -1567,3 +1567,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
+
+    @property
+    def tool_free(self) -> bool:
+        """Whether the harness and runner must expose no tools for this agent."""
+        value = self.executor.config.get("tool_free")
+        return value is True or (isinstance(value, str) and value.lower() == "true")

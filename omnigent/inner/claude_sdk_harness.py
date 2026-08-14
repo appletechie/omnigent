@@ -112,6 +112,7 @@ _ENV_PERMISSION_MODE = "HARNESS_CLAUDE_SDK_PERMISSION_MODE"
 _ENV_OS_ENV = "HARNESS_CLAUDE_SDK_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
+_ENV_TOOL_FREE = "HARNESS_CLAUDE_SDK_TOOL_FREE"
 _ENV_BUNDLE_DIR = "HARNESS_CLAUDE_SDK_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_CLAUDE_SDK_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"
@@ -296,6 +297,7 @@ def _build_claude_sdk_executor() -> Executor:
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
         api_key_helper=os.environ.get(_ENV_API_KEY_HELPER) or None,
+        tool_free=os.environ.get(_ENV_TOOL_FREE, "").strip().lower() in ("1", "true", "yes"),
     )
 
 

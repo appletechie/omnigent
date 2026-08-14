@@ -1171,6 +1171,8 @@ def _build_claude_sdk_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
+    if spec.tool_free:
+        env["HARNESS_CLAUDE_SDK_TOOL_FREE"] = "1"
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_CLAUDE_SDK_MODEL"] = model
@@ -1296,17 +1298,8 @@ def _build_codex_spawn_env(
     Maps spec.executor fields → the ``HARNESS_CODEX_*`` env vars
     defined in ``omnigent/inner/codex_harness.py``. Mirrors
     :func:`_build_claude_sdk_spawn_env` — same per-spawn env-var
-    pattern from §Step 5a. The codex-specific env vars
-    (``HARNESS_CODEX_PATH``, ``HARNESS_CODEX_ENABLE_WEB_SEARCH``,
-    ``HARNESS_CODEX_DISABLE_NATIVE_TOOLS``) are not threaded
-    through here in v1: the legacy
-    :func:`omnigent.inner.executor_factory.create_executor`
-    path doesn't surface them either, so AP-side parity is
-    preserved by leaving them at the inner executor's defaults.
-    Operators who want non-default values set those env vars
-    on the Omnigent server directly (they propagate to the subprocess
-    through normal env inheritance — the wrap's per-spawn
-    overrides only override, they don't filter).
+    pattern from §Step 5a. Per-agent native-tool and web-search
+    switches are forwarded to the isolated harness process.
 
     :param spec: The agent spec.
     :param workdir: The bundle's on-disk path (extracted by the
@@ -1321,6 +1314,18 @@ def _build_codex_spawn_env(
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_CODEX_MODEL"] = model
+    if "disable_native_tools" in spec.executor.config:
+        env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = (
+            "1" if _config_flag_is_true(spec.executor.config["disable_native_tools"]) else "0"
+        )
+    if "enable_web_search" in spec.executor.config:
+        env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = (
+            "1" if _config_flag_is_true(spec.executor.config["enable_web_search"]) else "0"
+        )
+    if "minimal_config" in spec.executor.config:
+        env["HARNESS_CODEX_MINIMAL_CONFIG"] = (
+            "1" if _config_flag_is_true(spec.executor.config["minimal_config"]) else "0"
+        )
 
     # Generic-provider branch (slotted ahead of the legacy-profile /
     # databricks-prefix path): a ProviderAuth on the spec, or — when the spec

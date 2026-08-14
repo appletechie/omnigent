@@ -1,0 +1,20 @@
+spec_version: 1
+name: polly-review
+description: Fixed, tool-free Claude and Codex reviewers for Polly Review.
+spawn: false
+async: false
+skills: none
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  This agent contains Polly Review's fixed reviewers. The integration invokes
+  the reviewers directly.
+
+tools:
+  agents:
+    - claude_review
+    - codex_review

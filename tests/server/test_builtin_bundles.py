@@ -22,8 +22,10 @@ import yaml
 from omnigent.errors import OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.native_coding_agents import NATIVE_CODING_AGENTS as _NATIVE_CODING_AGENTS
+from omnigent.runtime.workflow import _config_flag_is_true
 from omnigent.server import app
 from omnigent.spec import load, materialize_bundle
+from omnigent.spec.types import SharePolicy
 
 # Native built-ins are seeded through one registry-driven builder,
 # ``_build_native_bundle(provider)`` (PR 1.7). We exercise EVERY native agent
@@ -38,6 +40,7 @@ _NATIVE_BUILDERS = [(agent.key, f"{agent.agent_name}.yaml") for agent in _NATIVE
 _EXAMPLE_BUILDERS = [
     ("_build_debby_bundle", "config.yaml", True),
     ("_build_polly_bundle", "config.yaml", True),
+    ("_build_polly_review_bundle", "config.yaml", True),
 ]
 
 
@@ -50,6 +53,7 @@ def _shipped_example_missing(builder: str) -> bool:
     source = {
         "_build_debby_bundle": app._DEBBY_BUNDLE_SOURCE,
         "_build_polly_bundle": app._POLLY_BUNDLE_SOURCE,
+        "_build_polly_review_bundle": app._POLLY_REVIEW_BUNDLE_SOURCE,
     }[builder]
     return not (source / "config.yaml").is_file()
 
@@ -137,7 +141,47 @@ _SHIPPED_SUB_AGENT_EXAMPLES = [
         {"claude_code", "codex", "opencode", "cursor", "hermes", "pi"},
     ),
     ("debby", app._DEBBY_BUNDLE_SOURCE, {"claude", "gpt"}),
+    (
+        "polly-review",
+        app._POLLY_REVIEW_BUNDLE_SOURCE,
+        {"claude_review", "codex_review"},
+    ),
 ]
+
+
+def test_polly_review_workers_are_fixed_and_tool_free() -> None:
+    """The built-in review workers cannot spawn, load skills, or access the OS."""
+    spec = load(app._POLLY_REVIEW_BUNDLE_SOURCE, expand_env=False)
+    assert spec.name == "polly-review"
+    assert spec.tools.agents == ["claude_review", "codex_review"]
+
+    workers = {worker.name: worker for worker in spec.sub_agents}
+    assert set(workers) == {"claude_review", "codex_review"}
+    assert workers["claude_review"].executor.config["harness"] == "claude-sdk"
+    assert workers["codex_review"].executor.config["harness"] == "codex"
+
+    for worker in workers.values():
+        assert worker.spawn is False
+        assert worker.async_enabled is False
+        assert worker.timers is False
+        assert worker.agent_session_sharing is SharePolicy.NONE
+        assert worker.skills_filter == "none"
+        assert worker.skills == []
+        assert worker.os_env is None
+        assert worker.terminals is None
+        assert worker.mcp_servers == []
+        assert worker.sub_agents == []
+        assert worker.tools.agents == []
+        assert worker.tools.builtins == []
+        assert worker.local_tools == []
+        assert worker.tool_free is True
+
+    assert not any(path.is_dir() for path in app._POLLY_REVIEW_BUNDLE_SOURCE.rglob("skills"))
+
+    codex_config = workers["codex_review"].executor.config
+    assert _config_flag_is_true(codex_config["disable_native_tools"])
+    assert not _config_flag_is_true(codex_config["enable_web_search"])
+    assert _config_flag_is_true(codex_config["minimal_config"])
 
 
 @pytest.mark.parametrize(("name", "source", "expected_sub_agents"), _SHIPPED_SUB_AGENT_EXAMPLES)

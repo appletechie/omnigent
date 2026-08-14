@@ -186,7 +186,11 @@ def callback_client(
         yield client, keys
 
 
-def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
+def _do_callback(
+    client: TestClient,
+    id_token: str,
+    extra_state: dict[str, object] | None = None,
+) -> httpx.Response:
     """Drive a full ``/auth/callback`` with a valid state cookie.
 
     Crafts the signed state cookie the way ``/auth/login`` would, sets
@@ -206,6 +210,7 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
             "code_verifier": "verifier",
             "return_to": "/",
             "exp": int(time.time()) + 300,
+            **(extra_state or {}),
         },
         _TEST_SECRET,
         algorithm="HS256",
@@ -478,3 +483,107 @@ def test_callback_accepts_boolean_and_string_true(
     # Accepted as a verified identity → redirect + session.
     assert resp.status_code == 302, resp.text
     assert resp.cookies.get("ap_session") is not None
+
+
+def _session_claims(response: httpx.Response) -> dict[str, object]:
+    token = response.headers["set-cookie"].split("ap_session=", 1)[1].split(";", 1)[0]
+    return jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
+
+
+def test_reauth_callback_requires_fresh_idp_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A forced login fails closed when the verified IdP token is stale."""
+    client, keys = callback_client
+    now = int(time.time())
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            "auth_time": now - 3600,
+        }
+    )
+
+    response = _do_callback(client, token, extra_state={"reauth_at": now})
+
+    assert response.status_code == 403
+    assert response.cookies.get("ap_session") is None
+
+
+def test_reauth_callback_rejects_fresh_token_that_predates_signed_boundary(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A freshly issued token cannot satisfy a later signed reauth demand."""
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            "iat": reauth_at - 121,
+            "auth_time": reauth_at - 121,
+        }
+    )
+
+    response = _do_callback(client, token, extra_state={"reauth_at": reauth_at})
+
+    assert response.status_code == 403
+    assert response.cookies.get("ap_session") is None
+
+
+def test_reauth_callback_carries_proof_separately_from_iat(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """Only an IdP-attested reauthentication stamps session auth_time."""
+    client, keys = callback_client
+    now = int(time.time())
+    proven = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": now}
+    )
+    ordinary = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    proven_response = _do_callback(client, proven, extra_state={"reauth_at": now})
+    ordinary_response = _do_callback(client, ordinary)
+
+    assert proven_response.status_code == 302
+    assert _session_claims(proven_response)["auth_time"] >= now
+    assert "iat" in _session_claims(ordinary_response)
+    assert "auth_time" not in _session_claims(ordinary_response)
+
+
+def test_ordinary_callback_does_not_stamp_unsolicited_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """Fresh IdP metadata is not device-consent proof without signed demand."""
+    client, keys = callback_client
+    now = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": now}
+    )
+
+    response = _do_callback(client, token)
+
+    assert response.status_code == 302
+    assert "auth_time" not in _session_claims(response)
+
+
+def test_callback_verifies_id_token_once(
+    callback_client: tuple[TestClient, _IdpKeys],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Email and reauthentication consume the same verified claim set."""
+    client, keys = callback_client
+    calls = 0
+
+    def signing_key(self: object, token: str) -> jwt.PyJWK:
+        nonlocal calls
+        calls += 1
+        return keys.signing_key
+
+    monkeypatch.setattr(jwt.PyJWKClient, "get_signing_key_from_jwt", signing_key)
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    response = _do_callback(client, token)
+
+    assert response.status_code == 302
+    assert calls == 1

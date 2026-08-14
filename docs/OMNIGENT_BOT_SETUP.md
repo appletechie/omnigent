@@ -178,6 +178,15 @@ token and posts the review **as `omnigent-ci[bot]`**:
 > **trusted default branch** and fetches the PR diff via the API; PR-authored
 > code is never executed, and the minted token is scoped to the post step only.
 
+### Moving an existing webhook to native Polly Review
+
+Canary `omni integration polly` on one test repository first. Confirm an
+accepted job resumes after a daemon restart, replay the same delivery to prove
+it does not post twice, and push a newer PR head to prove the older job is
+superseded. For cutover, drain and stop the old webhook service before changing
+the GitHub App's single webhook URL to `/webhooks/github`. Keep the stopped old
+service and its data only for rollback; never run both consumers concurrently.
+
 ---
 
 ## Quick reference

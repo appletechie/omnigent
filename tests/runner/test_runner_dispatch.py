@@ -106,6 +106,58 @@ _TEST_HARNESS_NAME = "runner-test-default"
 _TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool_free", "expects_tools"), [(True, False), (False, True)])
+async def test_runner_honors_tool_free_without_affecting_ordinary_agents(
+    tool_free: bool, expects_tools: bool
+) -> None:
+    harness = _RecoveryScriptedHarnessClient(
+        [
+            "event: response.created\n"
+            'data: {"type":"response.created","response":{"id":"r1"}}\n\n',
+            "event: response.completed\n"
+            'data: {"type":"response.completed","response":{"id":"r1"}}\n\n',
+        ]
+    )
+
+    async def resolve(_agent_id: str, _session_id: str | None = None) -> AgentSpec:
+        return AgentSpec(
+            spec_version=1,
+            executor=ExecutorSpec(
+                type="omnigent", config={"harness": "claude-sdk", "tool_free": tool_free}
+            ),
+        )
+
+    app = create_runner_app(
+        process_manager=_RecoveryFakeProcessManager(harness),  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _recovery_runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_tool_free/events",
+            params={"stream": "true"},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_tool_free",
+                "content": [{"type": "input_text", "text": "review"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "injected_tool",
+                        "description": "must be dropped",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(harness.posted_bodies) == 1
+    assert ("tools" in harness.posted_bodies[0]) is expects_tools
+
+
 @pytest.fixture(autouse=True)
 def _assume_harness_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neutralize the sub-agent dispatch CLI preflight for hermetic tests.

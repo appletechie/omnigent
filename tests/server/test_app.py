@@ -866,6 +866,36 @@ def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> N
     assert polly_rows[0].version == first.version == 1
 
 
+def test_ensure_default_polly_review_agent_is_idempotent(seed_stores: _SeedStores) -> None:
+    """Startup seeds one stable, retrievable polly-review built-in."""
+    from omnigent.db.utils import builtin_agent_id
+
+    server_app._ensure_default_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    first = seed_stores.agent_store.get_by_name("polly-review")
+    assert first is not None
+    assert first.id == builtin_agent_id("polly-review")
+    assert first.session_id is None
+    assert seed_stores.artifact_store.get(first.bundle_location) is not None
+
+    server_app._ensure_default_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    rows = [
+        agent
+        for agent in seed_stores.agent_store.list(limit=100).data
+        if agent.name == "polly-review"
+    ]
+    assert len(rows) == 1
+    assert rows[0].id == first.id
+    assert rows[0].version == first.version == 1
+
+
 def test_ensure_default_polly_agent_refreshes_on_spec_change(
     seed_stores: _SeedStores, polly_src_copy: Path
 ) -> None:

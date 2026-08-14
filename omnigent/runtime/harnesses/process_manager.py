@@ -98,6 +98,18 @@ _DIR_MODE = 0o700
 # umask configurations that would otherwise loosen it.
 _SOCKET_MODE = 0o600
 
+_SAFETY_ENV_SUFFIXES = (
+    "_BUNDLE_DIR",
+    "_CWD",
+    "_DISABLE_NATIVE_TOOLS",
+    "_ENABLE_WEB_SEARCH",
+    "_MINIMAL_CONFIG",
+    "_OS_ENV",
+    "_PERMISSION_MODE",
+    "_SKILLS_FILTER",
+    "_TOOL_FREE",
+)
+
 # Default idle-reaper window: a subprocess that has not been
 # touched (via ``get_client`` or an AP→harness HTTP call updating
 # ``last_used_at``) for this many seconds is killed and unregistered.
@@ -470,12 +482,14 @@ class _SubprocessEntry:
         endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
+        safety_fingerprint: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self.process = process
         self.client = client
         self.endpoint = endpoint
         self.harness = harness
         self.model = model
+        self.safety_fingerprint = safety_fingerprint
         self.last_used_at: float = 0.0
 
 
@@ -493,6 +507,21 @@ def _model_env_key(harness: str) -> str:
         ``"claude-sdk"`` or ``"HARNESS_CODEX_MODEL"`` for ``"codex"``.
     """
     return f"HARNESS_{harness.upper().replace('-', '_')}_MODEL"
+
+
+def _safety_env_fingerprint(
+    harness: str,
+    env: dict[str, str] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return stable, process-fixed safety config from a harness spawn env."""
+    prefix = f"HARNESS_{harness.upper().replace('-', '_')}_"
+    return tuple(
+        sorted(
+            (key, value)
+            for key, value in (env or {}).items()
+            if key.startswith(prefix) and key.endswith(_SAFETY_ENV_SUFFIXES)
+        )
+    )
 
 
 def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -694,8 +723,8 @@ class HarnessProcessManager:
         runner subprocess of the right harness type, waits for the
         Unix socket to appear, and constructs an
         :class:`httpx.AsyncClient` over it. Subsequent calls
-        return the cached client (``env`` is ignored on cache
-        hits — config is fixed at first-spawn time).
+        return the cached client unless its process-fixed model or
+        safety configuration changed.
 
         Crash detection: if the previously-spawned subprocess has
         exited (``returncode is not None``), the entry is dropped
@@ -800,6 +829,20 @@ class HarnessProcessManager:
                 await self._close_entry(entry)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
+            if entry is not None:
+                requested_safety = (
+                    _safety_env_fingerprint(harness, env) if env is not None else None
+                )
+                if requested_safety is not None and requested_safety != entry.safety_fingerprint:
+                    _logger.info(
+                        "harness %s for conversation %s: safety config changed; respawning",
+                        harness,
+                        conversation_id,
+                    )
+                    replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                    await self._close_entry(entry)
+                    entry = None
+                    respawn_reason = "harness_respawn_config_switch"
             if entry is not None:
                 # The model is baked into the subprocess env at spawn time;
                 # a later turn requesting a different model (e.g. after the
@@ -1254,6 +1297,7 @@ class HarnessProcessManager:
                 # triggers a respawn in ``get_client`` — the model is a fixed
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
+                safety_fingerprint=_safety_env_fingerprint(harness, env),
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:

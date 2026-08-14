@@ -1381,6 +1381,7 @@ class ClaudeSDKExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
+        tool_free: bool = False,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1480,6 +1481,7 @@ class ClaudeSDKExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._tool_free = tool_free
         # Write the bundle's plugin manifest now (idempotent) so that
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
@@ -1569,7 +1571,7 @@ class ClaudeSDKExecutor(Executor):
                     "~/.databrickscfg profile."
                 )
             self._extra_env.update(gateway_env)
-        self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
+        self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "false" if tool_free else "true"
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -2202,7 +2204,9 @@ class ClaudeSDKExecutor(Executor):
             return
 
         # Build MCP tools from Omnigent tool schemas
-        mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
+        mcp_tools = (
+            _build_mcp_tools(tools, self._tool_executor) if tools and not self._tool_free else []
+        )
 
         # Create MCP server config for Omnigent tools. The SDK's
         # ``McpServerConfig`` union is opaque to us — we pass through
@@ -2236,7 +2240,7 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode in ("auto", "bypassPermissions"):
+        if not self._tool_free and self._permission_mode in ("auto", "bypassPermissions"):
             # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
@@ -2314,13 +2318,16 @@ class ClaudeSDKExecutor(Executor):
         # MCP tools (declared via ``os_env`` in the spec), not the
         # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
         # the base set so MCP definitions can be discovered on demand.
-        base_tools: list[str] = ["Skill", "ToolSearch"]
+        base_tools: list[str] = [] if self._tool_free else ["Skill", "ToolSearch"]
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
         # this is belt-and-suspenders).
-        resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
-            skills="all", setting_sources=None
+        resolved = (
+            _ResolvedSkills(skills=[], setting_sources=[])
+            if self._tool_free
+            else _resolve_skills_option(self._skills_filter)
+            or _ResolvedSkills(skills="all", setting_sources=None)
         )
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
@@ -2330,7 +2337,7 @@ class ClaudeSDKExecutor(Executor):
         # ``name`` (and thus the skill-listing prefix) comes from
         # the manifest written at construction time.
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and not self._tool_free:
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,

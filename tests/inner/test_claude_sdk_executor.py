@@ -1917,6 +1917,71 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
+    def test_tool_free_session_sends_no_dynamic_or_discovery_tools(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured_options = {}
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            @staticmethod
+            def create_sdk_mcp_server(**kwargs):
+                raise AssertionError(f"tool-free request created MCP server: {kwargs}")
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    captured_options.update(options.__dict__)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [_ResultMessage(session_id, "done")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor(tool_free=True)
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "session-a"}],
+                        [{"name": "sleep", "description": "sleep", "parameters": {}}],
+                        "",
+                    )
+                ]
+
+            self.assertEqual(captured_options["tools"], [])
+            self.assertEqual(captured_options["allowed_tools"], [])
+            self.assertEqual(captured_options["mcp_servers"], {})
+            self.assertEqual(captured_options["skills"], [])
+            self.assertEqual(captured_options["setting_sources"], [])
+            self.assertIsInstance(events[-1], TurnComplete)
+
+        _run(_t())
+
     def test_session_send_tool_is_exposed_via_mcp(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 

@@ -1,0 +1,16 @@
+spec_version: 1
+name: claude_review
+description: Tool-free Claude reviewer for an uploaded pull-request diff.
+spawn: false
+async: false
+skills: none
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+    tool_free: true
+
+prompt: |
+  Review only the supplied diff. Do not request repository access or take
+  actions. Return only JSON matching the schema in the task.

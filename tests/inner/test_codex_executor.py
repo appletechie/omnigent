@@ -38,6 +38,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.runtime.workflow import _build_codex_spawn_env
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
 def _run(coro):
@@ -956,6 +958,65 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_disables_native_shell_without_dynamic_tools(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+                disable_native_tools=True,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1"}},
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            _ = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="Be helpful.",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            params = session._request.await_args_list[0].args[1]
+            self.assertEqual(
+                params["config"]["features"],
+                {
+                    "unified_exec": False,
+                    "shell_tool": False,
+                    "apps": False,
+                    "browser_use": False,
+                    "computer_use": False,
+                    "image_generation": False,
+                    "multi_agent": False,
+                    "tool_search": False,
+                    "view_image": False,
+                },
+            )
+
+        _run(_t())
+
     def test_close_uses_process_tree_termination(self):
         async def _t():
             session = _CodexAppServerSession(
@@ -1169,6 +1230,88 @@ class TestCodexExecutor(unittest.TestCase):
                     await session.close()
 
                 self.assertFalse(codex_home.exists())
+
+        _run(_t())
+
+    def test_minimal_config_reaches_session_and_keeps_workspace_empty(self):
+        """Reviewer spawn config survives executor filtering through session startup."""
+
+        async def _t():
+            recorded_home: Path | None = None
+
+            async def _failing_create_subprocess_exec(*args, **kwargs):
+                nonlocal recorded_home
+                recorded_home = Path(kwargs["env"]["CODEX_HOME"])
+                self.assertTrue((recorded_home / "auth.json").is_symlink())
+                self.assertFalse((recorded_home / "AGENTS.md").exists())
+                self.assertFalse((recorded_home / "hooks.json").exists())
+                self.assertFalse((recorded_home / "plugins").exists())
+                config_text = (recorded_home / "config.toml").read_text()
+                self.assertIn('model_provider = "reviewer"', config_text)
+                self.assertIn("[model_providers.reviewer]", config_text)
+                self.assertNotIn("mcp_servers", config_text)
+                raise RuntimeError("start failed")
+
+            with tempfile.TemporaryDirectory() as workspace:
+                with tempfile.TemporaryDirectory() as source:
+                    source_home = Path(source)
+                    (source_home / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+                    (source_home / "AGENTS.md").write_text("ambient instructions")
+                    (source_home / "hooks.json").write_text('{"hooks": {}}')
+                    (source_home / "plugins" / "cache").mkdir(parents=True)
+                    (source_home / "config.toml").write_text(
+                        'model_provider = "reviewer"\n'
+                        '[model_providers.reviewer]\nbase_url = "https://example.test"\n'
+                        '[mcp_servers.ambient]\ncommand = "do-not-run"\n'
+                    )
+                    spec = AgentSpec(
+                        spec_version=1,
+                        name="codex-review",
+                        instructions="Review only the supplied diff.",
+                        executor=ExecutorSpec(
+                            type="omnigent",
+                            config={"harness": "codex", "minimal_config": True},
+                        ),
+                    )
+                    with (
+                        patch(
+                            "omnigent.runtime.workflow._resolve_provider_for_build",
+                            return_value=None,
+                        ),
+                        patch(
+                            "omnigent.runtime.workflow.codex_config_provider_dismissed",
+                            return_value=False,
+                        ),
+                        patch("omnigent.runtime.workflow._apply_harness_path_override"),
+                    ):
+                        spawn_env = _build_codex_spawn_env(spec)
+                    with patch.dict("os.environ", spawn_env, clear=True):
+                        executor = CodexExecutor(codex_path="/bin/echo")
+                    session = _CodexAppServerSession(
+                        codex_path="/bin/echo",
+                        cwd=workspace,
+                        env=executor._env,
+                        tool_executor=None,
+                    )
+                    session._request = AsyncMock(return_value={"result": {}})
+
+                    with (
+                        patch(
+                            "omnigent.inner.codex_executor._create_subprocess_exec",
+                            new=_failing_create_subprocess_exec,
+                        ),
+                        patch(
+                            "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+                            return_value=source_home,
+                        ),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "start failed"):
+                            await session.start()
+
+                    assert recorded_home is not None
+                    self.assertTrue(str(recorded_home).startswith(tempfile.gettempdir()))
+                    self.assertFalse(recorded_home.exists())
+                    self.assertEqual(list(Path(workspace).iterdir()), [])
 
         _run(_t())
 
@@ -2531,8 +2674,10 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
     (source / "AGENTS.md").write_text("global guidance")
     (source / "config.toml").write_text(
-        'model_provider = "Databricks"\n'
+        'model_provider = "unselected"\n'
+        'profile = "enterprise"\n'
         '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example"\n'
+        '[profiles.enterprise]\nmodel_provider = "Databricks"\n'
         "[plugins.example]\nenabled = true\n"
         '[mcp_servers.github]\nenabled = true\ncommand = "github-mcp"\n'
         '[marketplaces.example]\nsource = "https://example"\n'
@@ -2546,8 +2691,10 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     assert (target / "auth.json").is_symlink()
     assert not (target / "AGENTS.md").exists()
     config_text = (target / "config.toml").read_text()
-    assert 'model_provider = "Databricks"' in config_text
+    assert 'model_provider = "unselected"' in config_text
+    assert 'profile = "enterprise"' in config_text
     assert "[model_providers.Databricks]" in config_text
+    assert "[profiles.enterprise]" in config_text
     assert "plugins" not in config_text
     assert "mcp_servers" not in config_text
     assert "marketplaces" not in config_text
