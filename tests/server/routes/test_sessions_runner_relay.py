@@ -828,6 +828,36 @@ class _ScriptedThenDropRunnerClient:
 
 
 @pytest.mark.asyncio
+async def test_relay_keeps_completed_session_idle_when_tunnel_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later tunnel close must not retroactively fail a completed turn."""
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+
+    async def drop(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise orchestration._RelayTransportLost(intentional=False)
+
+    monkeypatch.setattr(orchestration, "_relay_runner_stream_once", drop)
+    session_id = "6d8fd21e91f746929cdf56ed9a9f5032"
+    orchestration._session_status_cache[session_id] = "idle"
+    store = _RecordingLabelStore()
+
+    try:
+        await orchestration._relay_runner_stream(
+            session_id,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            store,  # type: ignore[arg-type]
+        )
+        assert orchestration._session_status_cache.get(session_id) == "idle"
+        assert store.labels.get(session_id) is None
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
 async def test_relay_running_edge_clears_stale_intentional_stop_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

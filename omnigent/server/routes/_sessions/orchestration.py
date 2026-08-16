@@ -5675,7 +5675,7 @@ async def _relay_runner_stream(
                     None,
                     conversation_store,
                 )
-            else:
+            elif _session_status_cache.get(session_id) != "idle":
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
                 disconnect_error = ErrorDetail(
