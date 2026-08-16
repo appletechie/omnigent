@@ -122,20 +122,19 @@ _TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 # Env var name kept for the ops knob; ``<= 0`` disables.
 _TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 
-# Human approval / elicitation waits are real progress blockers, not wedged
-# model/tool silence. While a turn is explicitly parked on one of these waits,
-# use this longer ceiling for the idle watchdog. The deciding policy or
-# elicitation owner remains responsible for resolving/expiring the request.
-_TURN_AWAITING_HUMAN_TIMEOUT_S = float(
-    os.environ.get("HARNESS_TURN_AWAITING_HUMAN_TIMEOUT_S", "86400")
-)
-
 # Absolute per-turn ceiling: a hard cap on TOTAL turn duration, backstop
 # to the idle watchdog above. The idle watchdog never trips a turn that
 # keeps emitting, so a runaway-but-active loop (e.g. an infinite tool
 # loop emitting steadily) needs this. Generous so it never clips a real
 # long turn. ``<= 0`` disables. Whichever of (idle, absolute) trips first.
 _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "3600"))
+
+# Human approval / elicitation waits are real progress blockers, not wedged
+# model/tool silence. While explicitly parked, extend the idle watchdog to the
+# absolute ceiling by default; the absolute watchdog remains the hard total cap.
+_TURN_AWAITING_HUMAN_TIMEOUT_S = float(
+    os.environ.get("HARNESS_TURN_AWAITING_HUMAN_TIMEOUT_S", str(_TURN_ABSOLUTE_TIMEOUT_S))
+)
 
 
 @dataclass(frozen=True)
@@ -1530,7 +1529,7 @@ class HarnessApp:
             loop = asyncio.get_running_loop()
 
             def _reset() -> None:
-                # Push ONLY the idle deadline ``idle_timeout`` s past now
+                # Push ONLY the idle deadline for the current turn state past now
                 # (the absolute ceiling is never rescheduled). Called from
                 # ``ctx.emit`` during ``run_turn`` (inside the active
                 # context), so the reschedule is always valid.
