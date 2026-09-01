@@ -7020,6 +7020,41 @@ async def test_sys_session_get_info_tolerates_host_readiness_failure(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_get_info_reports_null_readiness_without_host() -> None:
+    """A session with no bound host reports ``configured_harnesses: null``.
+
+    ``host_id`` is legitimately ``None`` for CLI-initiated sessions and
+    caller-managed runners; the readiness lookup must be skipped (no
+    ``/v1/hosts/`` call) and the field projected as ``null`` (unknown).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    host_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "host_id": None})
+        if request.url.path.startswith("/v1/hosts/"):
+            host_calls.append(request.url.path)
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["configured_harnesses"] is None
+    assert host_calls == []
+
+
+@pytest.mark.asyncio
 async def test_sys_session_get_info_hides_native_ui_wrapper_agent_name() -> None:
     """A native-UI session describes itself with its clean public name.
 
