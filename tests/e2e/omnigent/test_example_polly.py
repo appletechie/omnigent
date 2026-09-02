@@ -117,8 +117,6 @@ def test_polly_preflights_host_harness_readiness() -> None:
     config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
     assert "sys_session_get_info({})" in config
     assert "`configured_harnesses` map" in config
-    # The shell probe survives only as the fallback for sessions with no
-    # bound host (configured_harnesses null); readiness stays the primary gate.
     assert config.index("configured_harnesses") < config.index("command -v")
 
 

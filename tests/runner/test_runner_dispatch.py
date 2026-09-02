@@ -7021,12 +7021,7 @@ async def test_sys_session_get_info_tolerates_host_readiness_failure(
 
 @pytest.mark.asyncio
 async def test_sys_session_get_info_reports_null_readiness_without_host() -> None:
-    """A session with no bound host reports ``configured_harnesses: null``.
-
-    ``host_id`` is legitimately ``None`` for CLI-initiated sessions and
-    caller-managed runners; the readiness lookup must be skipped (no
-    ``/v1/hosts/`` call) and the field projected as ``null`` (unknown).
-    """
+    """Skip the host lookup when the session has no bound host."""
     from omnigent.runner.tool_dispatch import execute_tool
 
     host_calls: list[str] = []
